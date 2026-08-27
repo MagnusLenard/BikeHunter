@@ -84,6 +84,8 @@ def load_cloud_config():
             "DE": bool(s.get("country_de", True)),
         },
         "telegram": s.get("telegram_settings") if isinstance(s.get("telegram_settings"), dict) else parse_jsonish(s.get("telegram_settings"), {}),
+        "dashboard_url": str(s.get("dashboard_url") or "https://bikehunter.magnuslenard.workers.dev"),
+        "initial_digest_sent": bool(s.get("initial_digest_sent", False)),
     }
 
     bikes = []
@@ -193,9 +195,9 @@ def flag(code: str) -> str:
     return {"NL": "🇳🇱", "BE": "🇧🇪", "DE": "🇩🇪"}.get(code, "🏳️")
 
 
-def send_telegram(kind: str, x: dict, bike: dict):
+def send_telegram(kind: str, x: dict, bike: dict, dashboard_url: str):
     name = f"{bike['make']} {bike['model']}".strip()
-    top = "🆕 <b>NEW LISTING</b>" if kind == "new" else "💸 <b>PRICE DROP</b>"
+    top = "🆕 <b>NEWLY FOUND</b>" if kind == "new" else "💸 <b>PRICE DROP</b>"
     lines = [top, f"<b>{html.escape(name)}</b>"]
     if kind == "drop":
         drop = int(x.get("price_drop") or 0)
@@ -212,7 +214,10 @@ def send_telegram(kind: str, x: dict, bike: dict):
         details.append("⚠️ Conditional price")
     lines.append(" · ".join(details))
     caption = "\n".join(lines)
-    markup = json.dumps({"inline_keyboard": [[{"text": "Open listing ↗", "url": x["url"]}]]}, ensure_ascii=False)
+    markup = json.dumps({"inline_keyboard": [
+        [{"text": "Open listing ↗", "url": x["url"]}],
+        [{"text": "🏍 Open BikeHunter", "url": dashboard_url}],
+    ]}, ensure_ascii=False)
     params = {"chat_id": TELEGRAM_CHAT_ID, "parse_mode": "HTML", "reply_markup": markup}
     photo = x.get("image_url")
     if photo:
@@ -223,6 +228,26 @@ def send_telegram(kind: str, x: dict, bike: dict):
             print(f"Telegram photo fallback: {type(e).__name__}: {e}")
     tg_call("sendMessage", {**params, "text": caption, "disable_web_page_preview": "false"})
 
+
+
+def send_initial_digest(current: list[dict], bikes_by_slug: dict, dashboard_url: str):
+    top5 = sorted(current, key=lambda x: int(x.get("score") or 0), reverse=True)[:5]
+    lines = ["🏆 <b>BikeHunter is live — Top 5 deals</b>", ""]
+    for i, x in enumerate(top5, 1):
+        bike = bikes_by_slug.get(x.get("bike_id"), {})
+        name = f"{bike.get('make','')} {bike.get('model','')}".strip() or str(x.get("title") or "Bike")
+        lines.append(
+            f"<b>{i}. {html.escape(name)}</b> — {euro(x['price'])} · {x.get('year')} · {km(x.get('km'))} · {flag(str(x.get('country')))} · {int(x.get('score') or 0)}/100"
+        )
+    lines += ["", "From now on I’ll only alert you for newly found listings and price drops."]
+    markup = json.dumps({"inline_keyboard": [[{"text": "🏍 Open all deals in BikeHunter", "url": dashboard_url}]]}, ensure_ascii=False)
+    tg_call("sendMessage", {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "parse_mode": "HTML",
+        "text": "\n".join(lines),
+        "reply_markup": markup,
+        "disable_web_page_preview": "true",
+    })
 
 def chunked(items, size=100):
     for i in range(0, len(items), size):
@@ -348,8 +373,24 @@ def main() -> int:
             )
 
         tg_cfg = settings.get("telegram") or {}
+        dashboard_url = settings.get("dashboard_url") or "https://bikehunter.magnuslenard.workers.dev"
+        telegram_ready = tg_cfg.get("enabled", True) and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+
+        # One-time welcome digest: Top 5 overall + dashboard link.
+        if telegram_ready and not settings.get("initial_digest_sent", False):
+            try:
+                send_initial_digest(current, bikes_by_slug, dashboard_url)
+                sb_request(
+                    "PATCH",
+                    "app_settings?id=eq.1",
+                    {"initial_digest_sent": True, "updated_at": now_iso()},
+                    "return=minimal",
+                )
+            except Exception as e:
+                warnings.append(f"Telegram initial digest: {type(e).__name__}: {e}")
+
         alert_queue: list[tuple[str, dict]] = []
-        if not first_baseline and tg_cfg.get("enabled", True) and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        if not first_baseline and telegram_ready:
             if tg_cfg.get("notify_new", True):
                 alert_queue += [("new", x) for x in current if x.get("new")]
             if tg_cfg.get("notify_price_drop", True):
@@ -358,7 +399,7 @@ def main() -> int:
             max_alerts = int(tg_cfg.get("max_alerts_per_scan", 20) or 20)
             for kind, x in alert_queue[:max_alerts]:
                 try:
-                    send_telegram(kind, x, bikes_by_slug[x["bike_id"]])
+                    send_telegram(kind, x, bikes_by_slug[x["bike_id"]], dashboard_url)
                 except Exception as e:
                     warnings.append(f"Telegram {x.get('title')}: {type(e).__name__}: {e}")
 
