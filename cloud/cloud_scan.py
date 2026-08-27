@@ -230,6 +230,36 @@ def send_telegram(kind: str, x: dict, bike: dict, dashboard_url: str):
 
 
 
+def send_top_deal(x: dict, bike: dict, dashboard_url: str, rank: int):
+    name = f"{bike.get('make','')} {bike.get('model','')}".strip() or str(x.get("title") or "Bike")
+    lines = [
+        f"🏆 <b>TOP DEAL #{rank}</b>",
+        f"<b>{html.escape(name)}</b>",
+        f"<b>{euro(x['price'])}</b>",
+        f"{x.get('year')} · {km(x.get('km'))} · {flag(str(x.get('country')))} {html.escape(str(x.get('location') or x.get('country') or ''))}",
+    ]
+    details = [f"Score {int(x.get('score') or 0)}/100"]
+    if x.get("sweet_spot"):
+        details.append("⭐ Sweet spot")
+    if x.get("conditional_price"):
+        details.append("⚠️ Conditional price")
+    lines.append(" · ".join(details))
+    caption = "\n".join(lines)
+    markup = json.dumps({"inline_keyboard": [
+        [{"text": "Open listing ↗", "url": x["url"]}],
+        [{"text": "🏍 Open BikeHunter", "url": dashboard_url}],
+    ]}, ensure_ascii=False)
+    params = {"chat_id": TELEGRAM_CHAT_ID, "parse_mode": "HTML", "reply_markup": markup}
+    photo = x.get("image_url")
+    if photo:
+        try:
+            tg_call("sendPhoto", {**params, "photo": photo, "caption": caption[:1024]}, timeout=40)
+            return
+        except Exception as e:
+            print(f"Telegram top-deal photo fallback: {type(e).__name__}: {e}")
+    tg_call("sendMessage", {**params, "text": caption, "disable_web_page_preview": "false"})
+
+
 def send_initial_digest(current: list[dict], bikes_by_slug: dict, dashboard_url: str):
     top5 = sorted(current, key=lambda x: int(x.get("score") or 0), reverse=True)[:5]
     lines = ["🏆 <b>BikeHunter is live — Top 5 deals</b>", ""]
@@ -239,7 +269,7 @@ def send_initial_digest(current: list[dict], bikes_by_slug: dict, dashboard_url:
         lines.append(
             f"<b>{i}. {html.escape(name)}</b> — {euro(x['price'])} · {x.get('year')} · {km(x.get('km'))} · {flag(str(x.get('country')))} · {int(x.get('score') or 0)}/100"
         )
-    lines += ["", "From now on I’ll only alert you for newly found listings and price drops."]
+    lines += ["", "Below are the 5 deal cards with direct listing links.", "After this, I’ll only alert you for newly found listings and price drops."]
     markup = json.dumps({"inline_keyboard": [[{"text": "🏍 Open all deals in BikeHunter", "url": dashboard_url}]]}, ensure_ascii=False)
     tg_call("sendMessage", {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -248,6 +278,8 @@ def send_initial_digest(current: list[dict], bikes_by_slug: dict, dashboard_url:
         "reply_markup": markup,
         "disable_web_page_preview": "true",
     })
+    for i, x in enumerate(top5, 1):
+        send_top_deal(x, bikes_by_slug.get(x.get("bike_id"), {}), dashboard_url, i)
 
 def chunked(items, size=100):
     for i in range(0, len(items), size):
@@ -376,7 +408,8 @@ def main() -> int:
         dashboard_url = settings.get("dashboard_url") or "https://bikehunter.magnuslenard.workers.dev"
         telegram_ready = tg_cfg.get("enabled", True) and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
 
-        # One-time welcome digest: Top 5 overall + dashboard link.
+        # One-time welcome digest: summary + exactly 5 deal cards + dashboard link.
+        initial_digest_ran = False
         if telegram_ready and not settings.get("initial_digest_sent", False):
             try:
                 send_initial_digest(current, bikes_by_slug, dashboard_url)
@@ -386,11 +419,13 @@ def main() -> int:
                     {"initial_digest_sent": True, "updated_at": now_iso()},
                     "return=minimal",
                 )
+                initial_digest_ran = True
             except Exception as e:
                 warnings.append(f"Telegram initial digest: {type(e).__name__}: {e}")
 
         alert_queue: list[tuple[str, dict]] = []
-        if not first_baseline and telegram_ready:
+        # Do not mix normal NEW/PRICE DROP alerts into the same run as the one-time Top 5 welcome digest.
+        if not first_baseline and telegram_ready and not initial_digest_ran:
             if tg_cfg.get("notify_new", True):
                 alert_queue += [("new", x) for x in current if x.get("new")]
             if tg_cfg.get("notify_price_drop", True):
