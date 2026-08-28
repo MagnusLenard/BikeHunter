@@ -284,11 +284,17 @@ def search_bike(bike: dict) -> tuple[list[dict], str]:
         if not relevant(combined, bike):
             continue
         full_url = href if href.startswith("http") else BASE + href
+        # The card body may contain unrelated euro amounts (financing, nearby-card text,
+        # accessories, etc.). When the listing title itself contains the asking price,
+        # that is the most reliable value. Fall back to the card body only if needed.
+        title_price = parse_price(title)
+        body_price = parse_price(text)
+        asking_price = title_price if title_price is not None else body_price
         listings.append({
             "source_id": lid,
             "bike_id": bike["id"],
             "title": title,
-            "price": parse_price(text),
+            "price": asking_price,
             "year": parse_year(title, text),
             "km": parse_km(text),
             "location": "Netherlands",
