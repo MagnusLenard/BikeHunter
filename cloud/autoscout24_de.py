@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import html as html_lib
+import json
 import re
 import ssl
 from urllib.error import HTTPError, URLError
@@ -106,21 +107,19 @@ def conditional_price(fragment: str) -> bool:
 
 
 def parse_price(fragment: str) -> int | None:
-    # Prefer the dedicated price element if present.
-    m = re.search(
-        r"data-testid=[\"']regular-price[\"'][^>]*>(.*?)</[^>]+>",
-        fragment,
-        flags=re.I | re.S,
-    )
-    candidates = [strip_tags(m.group(1))] if m else []
-    candidates.append(_text(fragment))
-    for value in candidates:
-        p = re.search(r"(?:€|EUR|&euro;)\s*([0-9][0-9.\s]{1,10})", value, flags=re.I)
-        if p:
-            number = _parse_int(p.group(1))
-            if number is not None and 100 <= number <= 100000:
-                return number
-    return None
+    """Parse the visible advertised card price.
+
+    AutoScout can expose both an old/regular price and a reduced/current price in the
+    same card. Prefer the lowest plausible *purchase* price, while ignoring tiny
+    finance/monthly amounts. The detail page is verified later and remains authoritative.
+    """
+    text = _text(fragment)
+    values: list[int] = []
+    for m in re.finditer(r"(?:€|EUR|&euro;)\s*([0-9][0-9.\s]{1,10})", text, flags=re.I):
+        number = _parse_int(m.group(1))
+        if number is not None and 1000 <= number <= 100000:
+            values.append(number)
+    return min(values) if values else None
 
 
 def parse_year(fragment: str) -> int | None:
@@ -172,31 +171,142 @@ def _unescape_url(value: str) -> str:
 
 
 def extract_listing_url(fragment: str, page: str, title: str) -> str | None:
+    """Return only a URL that is physically inside this exact result card.
+
+    The old parser searched the whole page when a card link was missing. That could pair
+    bike A's title/price with bike B's URL. For alerts, no link is better than a wrong link.
+    """
     patterns = [
         r"href\s*=\s*[\"']([^\"']*(?:/angebote/|/offers/)[^\"']*)[\"']",
         r"[\"'](?:url|href)[\"']\s*:\s*[\"']([^\"']*(?:/angebote/|/offers/)[^\"']*)[\"']",
         r"(https?:\\?/\\?/(?:www\.)?autoscout24\.(?:de|com)[^\"'<>\s]*(?:angebote|offers)[^\"'<>\s]*)",
     ]
-    for haystack in (fragment, page):
-        for pattern in patterns:
-            for m in re.finditer(pattern, haystack, flags=re.I):
-                value = _unescape_url(m.group(1))
-                if not value:
-                    continue
-                # When scanning the whole page, prefer a URL whose nearby data mentions the title.
-                if haystack is page and title and len(title) >= 8:
-                    pos = m.start()
-                    nearby = strip_tags(page[max(0, pos - 4500): min(len(page), pos + 4500)])
-                    key = re.sub(r"\W+", "", title.lower())[:22]
-                    if key and key not in re.sub(r"\W+", "", nearby.lower()):
-                        continue
-                if value.startswith("//"):
-                    return "https:" + value
-                if value.startswith("/"):
-                    return BASE + value
-                if value.startswith("http"):
-                    return value
+    for pattern in patterns:
+        for m in re.finditer(pattern, fragment, flags=re.I):
+            value = _unescape_url(m.group(1))
+            if value.startswith("//"):
+                return "https:" + value
+            if value.startswith("/"):
+                return BASE + value
+            if value.startswith("http"):
+                return value
     return None
+
+
+def _norm_model(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def strict_model_match(title: str, bike: dict) -> bool:
+    """Conservative model check to stop broad AutoScout model pages crossing bikes."""
+    t = _norm_model(title)
+    model = _norm_model(str(bike.get("model", "")))
+    bid = str(bike.get("id", ""))
+
+    rules = {
+        "honda-cbr600rr": lambda x: "cbr600rr" in x,
+        "honda-cbr600f": lambda x: "cbr600f" in x and "cbr600rr" not in x,
+        "honda-cbr650r": lambda x: "cbr650r" in x,
+        "honda-cbr500r": lambda x: "cbr500r" in x,
+        "yamaha-r3": lambda x: "yzfr3" in x or "yamahar3" in x,
+        "yamaha-r6": lambda x: "yzfr6" in x or "yamahar6" in x,
+        "yamaha-r7": lambda x: "yzfr7" in x or "yamahar7" in x,
+        "honda-rebel500": lambda x: "cmx500" in x or "rebel500" in x,
+        "triumph-street-triple-675": lambda x: "streettriple675" in x,
+        "triumph-daytona-675": lambda x: "daytona675" in x,
+        "suzuki-gsxr600": lambda x: "gsxr600" in x,
+    }
+    if bid in rules:
+        return bool(rules[bid](t))
+    if model:
+        return model in t
+    return relevant(title, bike)
+
+
+def _jsonld_objects(page: str):
+    for m in re.finditer(r"<script\b[^>]*type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>", page, flags=re.I | re.S):
+        raw = html_lib.unescape(m.group(1)).strip()
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        stack = obj if isinstance(obj, list) else [obj]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                yield cur
+                for v in cur.values():
+                    if isinstance(v, dict):
+                        stack.append(v)
+                    elif isinstance(v, list):
+                        stack.extend(x for x in v if isinstance(x, (dict, list)))
+            elif isinstance(cur, list):
+                stack.extend(cur)
+
+
+def _detail_title_and_price(page: str) -> tuple[str | None, int | None]:
+    titles: list[str] = []
+    prices: list[int] = []
+    for obj in _jsonld_objects(page):
+        typ = str(obj.get("@type", "")).lower()
+        if typ in {"product", "vehicle", "motorcycle", "offer"} or "offer" in typ:
+            name = obj.get("name") or obj.get("headline")
+            if isinstance(name, str) and 3 <= len(name.strip()) <= 220:
+                titles.append(name.strip())
+            for key in ("price", "lowPrice", "highPrice"):
+                val = obj.get(key)
+                if val is not None:
+                    n = _parse_int(str(val))
+                    if n is not None and 1000 <= n <= 100000:
+                        prices.append(n)
+            offers = obj.get("offers")
+            if isinstance(offers, dict):
+                for key in ("price", "lowPrice", "highPrice"):
+                    val = offers.get(key)
+                    if val is not None:
+                        n = _parse_int(str(val))
+                        if n is not None and 1000 <= n <= 100000:
+                            prices.append(n)
+
+    if not titles:
+        m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)', page, flags=re.I)
+        if m:
+            titles.append(html_lib.unescape(m.group(1)).strip())
+        else:
+            m = re.search(r"<h1\b[^>]*>(.*?)</h1>", page, flags=re.I | re.S)
+            if m:
+                titles.append(strip_tags(m.group(1)).strip())
+
+    # Fallback to explicit price metadata / visible price labels.
+    if not prices:
+        for pat in (
+            r'["\']price["\']\s*[:=]\s*["\']?([0-9][0-9.\s]{2,10})',
+            r'(?:€|EUR)\s*([0-9][0-9.\s]{2,10})',
+        ):
+            for m in re.finditer(pat, page, flags=re.I):
+                n = _parse_int(m.group(1))
+                if n is not None and 1000 <= n <= 100000:
+                    prices.append(n)
+
+    return (titles[0] if titles else None, min(prices) if prices else None)
+
+
+def verify_detail(url: str, bike: dict) -> tuple[str, int] | None:
+    """Verify the exact linked advert before BikeHunter can alert on it.
+
+    AutoScout is intentionally fail-closed here: if we cannot verify the detail page, the
+    result is skipped for this scan rather than sending a potentially wrong bike/price.
+    """
+    try:
+        page = fetch(url)
+    except Exception:
+        return None
+    title, price = _detail_title_and_price(page)
+    if not title or price is None:
+        return None
+    if not strict_model_match(title, bike):
+        return None
+    return title, price
 
 
 def extract_image(fragment: str) -> str | None:
@@ -372,7 +482,7 @@ def search_bike(bike: dict) -> tuple[list[dict], str]:
         probe_km = parse_km(fragment)
         if probe_price is not None and (probe_year is not None or probe_km is not None):
             parsed_card_count += 1
-        if not relevant(combined, bike):
+        if not strict_model_match(title, bike):
             continue
         relevant_card_count += 1
 
@@ -380,7 +490,18 @@ def search_bike(bike: dict) -> tuple[list[dict], str]:
         year = probe_year
         mileage = probe_km
         location, seller = parse_location(fragment)
-        direct_url = extract_listing_url(fragment, page, title) or url
+        direct_url = extract_listing_url(fragment, page, title)
+        if not direct_url:
+            continue
+
+        verified = verify_detail(direct_url, bike)
+        if not verified:
+            continue
+        verified_title, verified_price = verified
+        title = verified_title
+        price = verified_price
+        combined = f"{title} {_text(fragment)}"
+
         source_id = None
         uuid_match = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", direct_url, flags=re.I)
         if uuid_match:
@@ -406,8 +527,8 @@ def search_bike(bike: dict) -> tuple[list[dict], str]:
             "raw_text": _text(fragment)[:1200],
         })
 
-    if not listings:
-        listings = _fallback_text_listings(page, bike, url)
+    # Do not use the old text-only fallback for alerts: it cannot reliably pair a
+    # visible result with its exact advert URL. Accuracy is more important than count.
 
     # A 200 response with lots of search-page data but zero parsed cards is a parser
     # problem, not a healthy empty result. Surface it as a warning for easy diagnosis.
