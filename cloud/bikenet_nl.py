@@ -11,10 +11,13 @@ from urllib.request import Request, urlopen
 
 from marktplaats import detect_features, extract_first_image, relevant, strip_tags
 
-BASE = "https://www2.bikenet.nl"
+BASE = "https://www.bikenet.nl"
 SEARCH_PATH = "/occasions/"
 
-# BikeNet's public inventory uses canonical brand/type paths.  The earlier V2
+# BikeNet's public inventory uses canonical brand/type paths.
+# Use www.bikenet.nl: the legacy www2 host currently presents an expired TLS certificate
+# to Python/GitHub Actions, while the primary www host serves the same public inventory
+# with a valid certificate. Keep TLS verification enabled rather than bypassing it.  The earlier V2
 # used exact ?merk=&type= query values such as "cbr 600 f".  BikeNet groups
 # variants under broader type names (for example CBR 600), so those exact
 # query values could return a valid page with zero listing links.
