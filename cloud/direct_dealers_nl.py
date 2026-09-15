@@ -145,9 +145,13 @@ def _brand_slug(make: str) -> str:
 
 
 def _index_url(bike: dict, page_no: int = 1) -> str:
+    # Use the plain brand catalogue as the primary route. Goedhart's public
+    # brand pages are server-rendered and expose the real stock-unit links.
+    # The ?condition=10070 route has proven inconsistent for this cloud runner,
+    # so condition is verified on each product detail page instead.
     brand = _brand_slug(str(bike.get("make", "")))
-    base = f"{GOEDHART.base}/motoren/{brand}-motoren?condition=10070"
-    return base if page_no <= 1 else base + f"&p={page_no}"
+    base = f"{GOEDHART.base}/motoren/{brand}-motoren"
+    return base if page_no <= 1 else base + f"?p={page_no}"
 
 
 def _card_fragment(page: str, href: str) -> str:
@@ -229,6 +233,24 @@ def _parse_price(text: str) -> int | None:
     return min(values) if values else None
 
 
+def _stock_urls_from_page(page: str) -> list[tuple[str, str]]:
+    """Return Goedhart motorcycle stock URLs using DOM links and raw HTML."""
+    by_url: dict[str, str] = {u: a for u, a in _extract_links(page)}
+    host = urlparse(GOEDHART.base).netloc.lower()
+    patterns = (
+        r"href=[\"']([^\"']*?-rhc[0-9a-z-]+(?:[/?#][^\"']*)?)[\"']",
+        r"https?://www\.goedhartmotoren\.nl/[^\s\"'<>]*?-rhc[0-9a-z-]+[^\s\"'<>]*",
+    )
+    for pat in patterns:
+        for m in re.finditer(pat, page, flags=re.I):
+            raw = html_lib.unescape(m.group(1) if m.lastindex else m.group(0)).replace('\\/', '/')
+            url = urljoin(GOEDHART.base + '/', raw).split('#', 1)[0]
+            parsed = urlparse(url)
+            if parsed.scheme in ('http', 'https') and parsed.netloc.lower() == host:
+                by_url.setdefault(url, '')
+    return list(by_url.items())
+
+
 def _product_candidates(page: str, bike: dict) -> list[tuple[str, int | None]]:
     # V3 required a price from a guessed card fragment, which silently dropped
     # real products. V4 identifies the actual stock-unit URL first and verifies
@@ -241,16 +263,17 @@ def _product_candidates(page: str, bike: dict) -> list[tuple[str, int | None]]:
     out: list[tuple[str, int | None]] = []
     seen: set[str] = set()
 
-    for url, anchor in _extract_links(page):
+    for url, anchor in _stock_urls_from_page(page):
         path = unquote(urlparse(url).path).lower().rstrip("/")
         if path in ("", "/") or any(path.startswith(x) for x in blocked):
             continue
 
         fragment = _card_fragment(page, url)
         card_text = strip_tags(fragment)
-        # Match against both the best anchor and its surrounding card.  This
-        # survives image-only links and minor Magento template changes.
-        if not strict_model_match(f"{anchor} {card_text}", bike):
+        # Goedhart's canonical stock URL contains the model, e.g.
+        # /yamaha-yzf-r7-rhc00002463857. Match that first so image-only cards
+        # or Magento markup changes cannot silently discard the product.
+        if not (strict_model_match(url, bike) or strict_model_match(f"{anchor} {card_text}", bike)):
             continue
         tail = path.rsplit("/", 1)[-1]
         stock_like = bool(re.search(r"(?:^|-)rhc[0-9a-z-]+$", tail, flags=re.I))
@@ -290,6 +313,13 @@ def _structured_price(page: str) -> int | None:
             return value
     return None
 
+def _near_label_text(page: str, label: str, window: int = 700) -> str:
+    m = re.search(re.escape(label), page, flags=re.I)
+    if not m:
+        return ""
+    return strip_tags(page[m.start(): m.start() + window])
+
+
 def _field(text: str, label: str, pattern: str) -> str | None:
     m = re.search(rf"\b{re.escape(label)}\s*:?\s*({pattern})", text, flags=re.I)
     return m.group(1).strip() if m else None
@@ -320,7 +350,8 @@ def parse_detail(page: str, url: str, bike: dict, card_price: int | None = None)
     title = _extract_title(page, text, bike)
     if not title:
         return None
-    condition_match = re.search(r"\bConditie\s*:?[\s|]*(Occasion|Gebruikt|Nieuw)\b", text, flags=re.I)
+    condition_context = _near_label_text(page, "Conditie", 350)
+    condition_match = re.search(r"\b(Occasion|Gebruikt|Nieuw)\b", condition_context, flags=re.I)
     if condition_match and condition_match.group(1).lower() == "nieuw":
         return None
 
@@ -332,13 +363,23 @@ def parse_detail(page: str, url: str, bike: dict, card_price: int | None = None)
         if value:
             year = int(re.search(r"(?:19|20)\d{2}", value).group(0))
             break
+        ctx = _near_label_text(page, label, 350)
+        ym = re.search(r"(?:19|20)\d{2}", ctx)
+        if ym:
+            year = int(ym.group(0))
+            break
 
     mileage = None
     value = _field(text, "Kilometerstand", r"[0-9][0-9.\s]{0,10}\s*(?:km)?")
     if value:
         mileage = _num(value)
-        if mileage is not None and not 0 <= mileage <= 500000:
-            mileage = None
+    if mileage is None:
+        ctx = _near_label_text(page, "Kilometerstand", 350)
+        mm = re.search(r"([0-9][0-9.\s]{0,10})\s*Km\b", ctx, flags=re.I)
+        if mm:
+            mileage = _num(mm.group(1))
+    if mileage is not None and not 0 <= mileage <= 500000:
+        mileage = None
 
     return {
         "source_id": _source_id(url),
@@ -367,13 +408,19 @@ def search_goedhart(bike: dict) -> tuple[list[dict], str]:
 
     page_count = _max_index_pages(first_page)
     candidate_map: dict[str, int | None] = {}
+    discovered_stock_urls: set[str] = set()
 
     for page_no in range(1, page_count + 1):
         index_url = _index_url(bike, page_no)
         if index_url not in _PAGE_CACHE:
             time.sleep(0.20)
             _PAGE_CACHE[index_url] = fetch(index_url, retries=1)
-        for url, card_price in _product_candidates(_PAGE_CACHE[index_url], bike):
+        page = _PAGE_CACHE[index_url]
+        discovered_stock_urls.update(
+            u for u, _ in _stock_urls_from_page(page)
+            if "-rhc" in urlparse(u).path.lower()
+        )
+        for url, card_price in _product_candidates(page, bike):
             if url not in candidate_map or candidate_map[url] is None:
                 candidate_map[url] = card_price
 
@@ -395,8 +442,9 @@ def search_goedhart(bike: dict) -> tuple[list[dict], str]:
 
     unique = {x["source_id"]: x for x in listings}
     print(
-        f"  {GOEDHART.source}: scanned {page_count} catalogue page(s), "
-        f"{len(candidate_map)} matching stock-unit link(s) -> {len(unique)} parsed"
+        f"  {GOEDHART.source} / {bike.get('make','')} {bike.get('model','')}: "
+        f"scanned {page_count} catalogue page(s), {len(discovered_stock_urls)} stock URL(s), "
+        f"{len(candidate_map)} model match(es) -> {len(unique)} parsed"
         + (f" ({failed} detail fetch failed)" if failed else "")
     )
     return list(unique.values()), first_url
