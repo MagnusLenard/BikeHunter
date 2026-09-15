@@ -32,6 +32,8 @@ KNOWN_MODEL_SLUGS = {
     "triumph-street-triple-675": "street-triple-675",
     "triumph-daytona-675": "daytona-675",
     "suzuki-gsxr600": "gsx-r-600",
+    "aprilia-rs660": "rs-660",
+    "honda-hornet-750": "cb-750",
 }
 
 KNOWN_PATH_SUFFIXES = {
@@ -184,6 +186,8 @@ def strict_model_match(title: str, bike: dict) -> bool:
         "triumph-street-triple-675": lambda x: "streettriple675" in x,
         "triumph-daytona-675": lambda x: "daytona675" in x,
         "suzuki-gsxr600": lambda x: "gsxr600" in x,
+        "aprilia-rs660": lambda x: "rs660" in x,
+        "honda-hornet-750": lambda x: "cb750hornet" in x or "hornet750" in x,
     }
     if bid in rules:
         return bool(rules[bid](t))

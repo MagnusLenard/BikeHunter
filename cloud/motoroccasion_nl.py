@@ -27,6 +27,8 @@ MODEL_PAGES = {
     "triumph-street-triple-675": "/motoren/triumph-street-triple-675-b37-t3852.html",
     "triumph-daytona-675": "/motoren/triumph-daytona-675-b37-t3355.html",
     "suzuki-gsxr600": "/motoren/suzuki-gsx-r-600-b35-tg206.html",
+    "aprilia-rs660": "/motoren/aprilia-rs-660-b1-tg1427.html",
+    "honda-hornet-750": "/motoren/honda-cb-750-hornet-b18-t9347.html",
 }
 
 
@@ -80,6 +82,8 @@ def strict_model_match(title: str, bike: dict) -> bool:
         "triumph-street-triple-675": lambda x: "streettriple675" in x,
         "triumph-daytona-675": lambda x: "daytona675" in x,
         "suzuki-gsxr600": lambda x: "gsxr600" in x,
+        "aprilia-rs660": lambda x: "rs660" in x,
+        "honda-hornet-750": lambda x: "cb750" in x and "hornet" in x,
     }
     if bid in rules:
         return bool(rules[bid](t))

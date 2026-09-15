@@ -26,6 +26,8 @@ MODEL_PATHS = {
     "triumph-street-triple-675": "/motoren/merk-triumph/model-street-triple",
     "triumph-daytona-675": "/motoren/merk-triumph/model-daytona-675",
     "suzuki-gsxr600": "/motoren/merk-suzuki/model-gsx-r-600",
+    "aprilia-rs660": "/motoren/merk-aprilia/model-rs-660",
+    "honda-hornet-750": "/motoren/merk-honda/model-cb-750",
 }
 
 
@@ -79,6 +81,8 @@ def strict_model_match(title: str, bike: dict) -> bool:
         "triumph-street-triple-675": lambda x: "streettriple" in x and ("675" in x or "765" not in x),
         "triumph-daytona-675": lambda x: "daytona675" in x,
         "suzuki-gsxr600": lambda x: "gsxr600" in x,
+        "aprilia-rs660": lambda x: "rs660" in x,
+        "honda-hornet-750": lambda x: "cb750" in x and "hornet" in x,
     }
     if bid in rules:
         return bool(rules[bid](t))

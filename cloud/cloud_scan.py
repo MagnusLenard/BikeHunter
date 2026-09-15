@@ -337,6 +337,7 @@ def main() -> int:
         source_counts = {v[0]: 0 for v in all_adapters}
         source_attempts = {v[0]: 0 for v in all_adapters}
         source_errors_count = {v[0]: 0 for v in all_adapters}
+        source_blocked_403: set[str] = set()
         warnings: list[str] = []
         current: list[dict] = []
         bikes_by_slug = {b["id"]: b for b in bikes}
@@ -348,12 +349,19 @@ def main() -> int:
                 if not countries.get(code, True) or code not in adapters:
                     continue
                 for label, func, http_err, url_err in adapters[code]:
+                    if label in source_blocked_403:
+                        continue
                     source_attempts[label] += 1
                     try:
                         raw, _ = func(bike)
                     except http_err as e:
                         source_errors_count[label] += 1
-                        msg = f"{bike['make']} {bike['model']} / {label}: HTTP {getattr(e, 'code', '?')}"
+                        code_value = getattr(e, 'code', '?')
+                        if code_value == 403:
+                            source_blocked_403.add(label)
+                            msg = f"{label}: HTTP 403 (source rejected this cloud runner; remaining bikes skipped for this scan)"
+                        else:
+                            msg = f"{bike['make']} {bike['model']} / {label}: HTTP {code_value}"
                         warnings.append(msg); print("  WARN", msg); continue
                     except url_err as e:
                         source_errors_count[label] += 1
