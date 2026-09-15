@@ -20,25 +20,32 @@ class Dealer:
     name: str
     base: str
     city: str
-    max_pages: int = 40
+    max_pages: int
+    index_kind: str
 
 
+# IMPORTANT: use the dealers' canonical public HTTPS sites.
+# The old occasions.<dealer>.nl hosts currently present certificates that do not
+# match those hostnames, so Python correctly rejects them. Both dealers expose
+# their inventory on the main, valid-certificate domains as well.
 DEALERS = {
     "arie": Dealer(
         key="arie",
         source="Arie Molenaar Motors NL",
         name="Arie Molenaar Motors B.V.",
-        base="https://occasions.ariemolenaarmotors.nl",
+        base="https://www.ariemolenaarmotors.nl",
         city="IJsselstein",
-        max_pages=20,
+        max_pages=15,
+        index_kind="arie",
     ),
     "goedhart": Dealer(
         key="goedhart",
         source="Goedhart Motoren NL",
         name="Goedhart Motoren B.V.",
-        base="https://occasions.goedhartmotoren.nl",
+        base="https://www.goedhartmotoren.nl",
         city="Bodegraven",
         max_pages=40,
+        index_kind="goedhart",
     ),
 }
 
@@ -56,7 +63,9 @@ class HrefCollector(HTMLParser):
             self.hrefs.append(href)
 
 
-_INDEX_CACHE: dict[str, list[str]] = {}
+# Cache the downloaded inventory pages once per dealer. Every watched bike then
+# reuses the same pages instead of hammering the dealer nine times.
+_INDEX_PAGE_CACHE: dict[str, list[str]] = {}
 _DETAIL_CACHE: dict[str, str] = {}
 
 
@@ -124,13 +133,11 @@ _URL_ALIASES = {
     "triumph-daytona-675": ("daytona675",),
     "suzuki-gsxr600": ("gsxr600",),
     "aprilia-rs660": ("rs660",),
-    "honda-hornet-750": ("cb750", "hornet750"),
+    "honda-hornet-750": ("cb750hornet", "hornet750", "cb750"),
 }
 
 
 def _candidate_url(url: str, bike: dict) -> bool:
-    # BikeNet-powered dealer URLs include the actual model in /unit/<brand>/<model>/<id>.
-    # Decode %2B/+/hyphens away before comparing so the pre-filter is strict but cheap.
     path = unquote(urlparse(url).path).replace("+", " ")
     n = _norm(path)
     aliases = _URL_ALIASES.get(str(bike.get("id", "")))
@@ -140,29 +147,40 @@ def _candidate_url(url: str, bike: dict) -> bool:
     return bool(model and model in n)
 
 
-def _extract_unit_links(page: str, dealer: Dealer) -> list[str]:
+def _index_url(dealer: Dealer, page_no: int) -> str:
+    if dealer.index_kind == "arie":
+        if page_no <= 1:
+            return dealer.base + "/occasions/"
+        return dealer.base + f"/occasions/?pagina={page_no}"
+    if dealer.index_kind == "goedhart":
+        if page_no <= 1:
+            return dealer.base + "/motoren?condition=10070"
+        return dealer.base + f"/motoren?condition=10070&p={page_no}"
+    raise ValueError(f"Unknown dealer index kind: {dealer.index_kind}")
+
+
+def _extract_hrefs(page: str, base: str) -> list[str]:
     parser = HrefCollector()
     try:
         parser.feed(page)
     except Exception:
         pass
 
-    candidates = list(parser.hrefs)
-    # Fallbacks for sites that render the URL inside JSON/JS instead of a normal anchor.
-    candidates += re.findall(r"(?:https?://[^\"'<>\\]+)?(/unit/[^\"'<>\\?#]+)", page, flags=re.I)
-    candidates += [m.replace("\\/", "/") for m in re.findall(r"(?:https?:\\/\\/[^\"'<>]+)?(?:\\/unit\\/[^\"'<>?#]+)", page, flags=re.I)]
+    # Include hrefs embedded inside script/json too.
+    raw = list(parser.hrefs)
+    raw += re.findall(r'''href\s*=\s*["']([^"']+)["']''', page, flags=re.I)
+    raw += [m.replace("\\/", "/") for m in re.findall(r'''https?:\\/\\/[^"'<>\s]+''', page, flags=re.I)]
 
+    base_host = urlparse(base).netloc.lower()
     out: list[str] = []
     seen: set[str] = set()
-    dealer_host = urlparse(dealer.base).netloc.lower()
-    for href in candidates:
+    for href in raw:
         h = html_lib.unescape(str(href)).replace("\\/", "/").strip()
-        if "/unit/" not in h.lower():
+        if not h or h.startswith(("javascript:", "mailto:", "tel:")):
             continue
-        url = urljoin(dealer.base + "/", h).split("#", 1)[0]
+        url = urljoin(base + "/", h).split("#", 1)[0]
         parsed = urlparse(url)
-        # Keep the dealer-owned host. This avoids accidentally following image/CDN links.
-        if parsed.netloc.lower() != dealer_host:
+        if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != base_host:
             continue
         if url not in seen:
             seen.add(url)
@@ -170,20 +188,40 @@ def _extract_unit_links(page: str, dealer: Dealer) -> list[str]:
     return out
 
 
-def _index_url(dealer: Dealer, page_no: int) -> str:
-    if page_no <= 1:
-        return dealer.base + "/index.php"
-    return dealer.base + f"/index.php?pagina={page_no}"
+def _dealer_detail_links(page: str, dealer: Dealer) -> list[str]:
+    links = _extract_hrefs(page, dealer.base)
+    out: list[str] = []
+    for url in links:
+        path = unquote(urlparse(url).path).lower()
+        if dealer.index_kind == "arie":
+            # Canonical, certificate-valid detail route used by the public Arie site.
+            if "/occasion/" not in path:
+                continue
+        else:
+            # Goedhart product pages live directly under the main host. Exclude known
+            # navigation/content routes; model matching below will remove the rest.
+            blocked = (
+                "/motoren", "/blog", "/technische-tekeningen", "/winkel", "/contact",
+                "/werkplaats", "/verhuur", "/klantenservice", "/account", "/checkout",
+                "/catalogsearch", "/media/", "/static/",
+            )
+            if any(path.startswith(x) for x in blocked):
+                continue
+            if path in ("", "/"):
+                continue
+        out.append(url)
+    return out
 
 
-def _crawl_inventory(dealer: Dealer) -> list[str]:
-    cached = _INDEX_CACHE.get(dealer.key)
+def _crawl_inventory_pages(dealer: Dealer) -> list[str]:
+    cached = _INDEX_PAGE_CACHE.get(dealer.key)
     if cached is not None:
         return cached
 
-    all_links: list[str] = []
-    seen: set[str] = set()
-    successful_pages = 0
+    pages: list[str] = []
+    previous_signature: tuple[str, ...] | None = None
+    successful = 0
+
     for page_no in range(1, dealer.max_pages + 1):
         url = _index_url(dealer, page_no)
         try:
@@ -193,31 +231,38 @@ def _crawl_inventory(dealer: Dealer) -> list[str]:
                 break
             raise
 
-        links = _extract_unit_links(page, dealer)
+        links = _dealer_detail_links(page, dealer)
+        signature = tuple(links[:30])
         if page_no == 1 and not links:
-            raise ValueError(f"{dealer.name} inventory page returned no /unit/ listing links")
+            raise ValueError(f"{dealer.name} inventory page returned no dealer listing links")
         if not links:
             break
-
-        successful_pages += 1
-        new_links = [u for u in links if u not in seen]
-        if not new_links:
-            break
-        for u in new_links:
-            seen.add(u)
-            all_links.append(u)
-
-        # BikeNet dealer indexes normally show roughly a page of listings. If the final
-        # page contains fewer than a full page, the next request is unnecessary; repeat
-        # detection above is still the authoritative stop condition.
-        if page_no > 1 and len(links) < 5:
+        if previous_signature is not None and signature == previous_signature:
             break
 
-    if successful_pages == 0:
+        pages.append(page)
+        successful += 1
+        previous_signature = signature
+
+        # If there is no obvious next-page reference, stop after the current page.
+        # This is intentionally permissive because both dealer sites currently expose
+        # explicit page parameters and repeated-page detection protects us from loops.
+        text = strip_tags(page).lower()
+        if dealer.index_kind == "arie":
+            next_markers = (f"pagina={page_no + 1}", "volgende")
+        else:
+            next_markers = (f"p={page_no + 1}", "pagina volgende", "next")
+        if page_no > 1 and not any(marker in page.lower() or marker in text for marker in next_markers):
+            # Keep one extra page worth of tolerance for themes that omit explicit text.
+            if len(links) < 10:
+                break
+
+    if successful == 0:
         raise ValueError(f"{dealer.name} inventory could not be read")
-    _INDEX_CACHE[dealer.key] = all_links
-    print(f"  {dealer.source}: indexed {len(all_links)} dealer listings across {successful_pages} page(s)")
-    return all_links
+
+    _INDEX_PAGE_CACHE[dealer.key] = pages
+    print(f"  {dealer.source}: indexed {successful} inventory page(s) on canonical HTTPS host")
+    return pages
 
 
 def _detail_page(url: str) -> str:
@@ -227,15 +272,14 @@ def _detail_page(url: str) -> str:
 
 
 def _field(text: str, label: str, pattern: str) -> str | None:
-    # BikeNet detail pages render fields as e.g. "Bouwjaar:  |  2026". strip_tags()
-    # turns this into normal text, so tolerate punctuation/separators between label/value.
-    m = re.search(rf"\b{re.escape(label)}\s*:?\s*(?:\|\s*)?({pattern})", text, flags=re.I)
+    # Tolerate either "Label: value" or table-like "Label | value" text.
+    m = re.search(rf"\b{re.escape(label)}\s*:?[\s|\-]*({pattern})", text, flags=re.I)
     return m.group(1).strip() if m else None
 
 
 def _extract_title(page: str, text: str, bike: dict) -> str | None:
     headings = []
-    for tag in ("h1", "h2", "h3"):
+    for tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
         for m in re.finditer(rf"<{tag}\b[^>]*>(.*?)</{tag}>", page, flags=re.I | re.S):
             value = strip_tags(m.group(1)).strip()
             if value:
@@ -252,23 +296,33 @@ def _extract_title(page: str, text: str, bike: dict) -> str | None:
     return None
 
 
-def _parse_price(text: str) -> int | None:
-    # Stay near the top of the detail page so financing examples lower on the page cannot
-    # masquerade as the asking price. When a crossed-out old price and a current price are
-    # both present, the lower amount is the actual sale price.
-    head = text[:2600]
-    values: list[int] = []
-    for m in re.finditer(r"€\s*([0-9]{1,3}(?:[.\s][0-9]{3})+|[0-9]{3,5})(?:,-)?", head, flags=re.I):
-        n = _num(m.group(1))
-        if n is not None and 500 <= n <= 100000:
-            values.append(n)
-    return min(values) if values else None
+def _parse_price(text: str, title: str | None = None) -> int | None:
+    # Dealer pages have large navigation menus. Restrict price extraction to a window
+    # around the actual bike title when possible, then fall back to the whole page.
+    windows: list[str] = []
+    if title:
+        pos = text.lower().find(title.lower())
+        if pos >= 0:
+            windows.append(text[max(0, pos - 1200):pos + 1800])
+    windows.append(text)
+
+    for window in windows:
+        values: list[int] = []
+        for m in re.finditer(r"(?:€|eur)\s*([0-9]{1,3}(?:[.\s][0-9]{3})+|[0-9]{3,5})(?:[,.][0-9]{2}|,-)?", window, flags=re.I):
+            n = _num(m.group(1))
+            if n is not None and 500 <= n <= 100000:
+                values.append(n)
+        if values:
+            # Sale pages sometimes show current + crossed-out old price; current is lower.
+            return min(values)
+    return None
 
 
 def _source_id(url: str, dealer: Dealer) -> str:
-    tail = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
-    if tail and re.fullmatch(r"[A-Za-z0-9_-]{3,60}", tail):
-        return tail
+    path = unquote(urlparse(url).path).rstrip("/")
+    tail = path.rsplit("/", 1)[-1]
+    if tail and re.fullmatch(r"[A-Za-z0-9_.-]{3,100}", tail):
+        return dealer.key + "-" + tail.lower()
     return dealer.key + "-" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:18]
 
 
@@ -278,19 +332,22 @@ def parse_detail(page: str, url: str, bike: dict, dealer: Dealer) -> dict | None
     if not title:
         return None
 
-    price = _parse_price(text)
+    price = _parse_price(text, title)
 
     year = None
     value = _field(text, "Bouwjaar", r"(?:19|20)\d{2}")
     if not value:
         value = _field(text, "Modeljaar", r"(?:19|20)\d{2}")
+    if not value:
+        # Arie inventory/detail pages also expose "Model: 2023".
+        value = _field(text, "Model", r"(?:19|20)\d{2}")
     if value:
         m = re.search(r"(?:19|20)\d{2}", value)
         if m:
             year = int(m.group(0))
 
     mileage = None
-    value = _field(text, "Kilometerstand", r"[0-9][0-9.\s]{0,10}\s*km")
+    value = _field(text, "Kilometerstand", r"[0-9][0-9.\s]{0,10}\s*(?:km)?")
     if value:
         mileage = _num(value)
         if mileage is not None and not 0 <= mileage <= 500000:
@@ -316,28 +373,36 @@ def parse_detail(page: str, url: str, bike: dict, dealer: Dealer) -> dict | None
 
 
 def _search(dealer: Dealer, bike: dict) -> tuple[list[dict], str]:
-    links = _crawl_inventory(dealer)
-    candidates = [u for u in links if _candidate_url(u, bike)]
+    pages = _crawl_inventory_pages(dealer)
+
+    # Collect matching detail URLs from the canonical inventory pages.
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for page in pages:
+        for url in _dealer_detail_links(page, dealer):
+            if url in seen or not _candidate_url(url, bike):
+                continue
+            seen.add(url)
+            candidates.append(url)
+
     listings: list[dict] = []
     fetch_failures = 0
-    for url in candidates[:80]:
+    for url in candidates[:120]:
         try:
-            page = _detail_page(url)
-            item = parse_detail(page, url, bike, dealer)
+            detail = _detail_page(url)
+            item = parse_detail(detail, url, bike, dealer)
         except (HTTPError, URLError):
             fetch_failures += 1
             continue
         if item:
             listings.append(item)
 
-    # If every pre-filtered candidate failed to load, surface it as a source warning rather
-    # than silently reporting zero stock. Zero candidates is normal and not an error.
     if candidates and fetch_failures == len(candidates):
         raise ValueError(f"{dealer.name} matching detail pages could not be fetched")
 
     unique = {x["source_id"]: x for x in listings}
     print(f"  {dealer.source}: {len(candidates)} matching detail link(s) -> {len(unique)} parsed")
-    return list(unique.values()), dealer.base + "/index.php"
+    return list(unique.values()), _index_url(dealer, 1)
 
 
 def search_arie_molenaar(bike: dict) -> tuple[list[dict], str]:
