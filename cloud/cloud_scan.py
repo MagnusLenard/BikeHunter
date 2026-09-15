@@ -11,7 +11,10 @@ from urllib.request import Request, urlopen
 
 from marktplaats import HTTPError as MpHTTPError, URLError as MpURLError, search_bike as search_marktplaats
 from tweedehands import HTTPError as BeHTTPError, URLError as BeURLError, search_bike as search_2dehands
-from autoscout24_de import HTTPError as DeHTTPError, URLError as DeURLError, search_bike as search_autoscout24
+from autoscout24_de import HTTPError as DeHTTPError, URLError as DeURLError, search_bike as search_autoscout24_de
+from autoscout24_nl import HTTPError as AsNlHTTPError, URLError as AsNlURLError, search_bike as search_autoscout24_nl
+from motoroccasion_nl import HTTPError as MoHTTPError, URLError as MoURLError, search_bike as search_motoroccasion_nl
+from viabovag_nl import HTTPError as BovagHTTPError, URLError as BovagURLError, search_bike as search_viabovag_nl
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
@@ -296,22 +299,44 @@ def main() -> int:
         if not bikes:
             raise RuntimeError("No enabled bikes in Supabase")
 
-        prev_runs = sb_request("GET", "scan_runs?select=id,status&status=eq.finished&order=id.desc&limit=1") or []
+        prev_runs = sb_request("GET", "scan_runs?select=id,status,source_counts&status=eq.finished&order=id.desc&limit=1") or []
         first_baseline = len(prev_runs) == 0
+        previous_source_labels = set()
+        if prev_runs:
+            previous_counts = prev_runs[0].get("source_counts") or {}
+            if isinstance(previous_counts, str):
+                try:
+                    previous_counts = json.loads(previous_counts)
+                except Exception:
+                    previous_counts = {}
+            if isinstance(previous_counts, dict):
+                previous_source_labels = set(previous_counts.keys())
         existing_rows = sb_request("GET", "listings?select=source,external_id,price,bike_id,first_seen&limit=1000") or []
         existing = {(r["source"], str(r["external_id"])): r for r in existing_rows}
 
         countries = settings["countries"]
         priority = settings["country_priority"] or ["NL", "BE", "DE"]
+        # A country can have multiple independent sources. This lets NL scan both
+        # private-sale marketplaces and dealer aggregators in the same run.
         adapters = {
-            "NL": ("Marktplaats NL", search_marktplaats, MpHTTPError, MpURLError),
-            "BE": ("2dehands BE", search_2dehands, BeHTTPError, BeURLError),
-            "DE": ("AutoScout24 DE", search_autoscout24, DeHTTPError, DeURLError),
+            "NL": [
+                ("Marktplaats NL", search_marktplaats, MpHTTPError, MpURLError),
+                ("AutoScout24 NL", search_autoscout24_nl, AsNlHTTPError, AsNlURLError),
+                ("Motoroccasion NL", search_motoroccasion_nl, MoHTTPError, MoURLError),
+                ("viaBOVAG NL", search_viabovag_nl, BovagHTTPError, BovagURLError),
+            ],
+            "BE": [
+                ("2dehands BE", search_2dehands, BeHTTPError, BeURLError),
+            ],
+            "DE": [
+                ("AutoScout24 DE", search_autoscout24_de, DeHTTPError, DeURLError),
+            ],
         }
 
-        source_counts = {v[0]: 0 for v in adapters.values()}
-        source_attempts = {v[0]: 0 for v in adapters.values()}
-        source_errors_count = {v[0]: 0 for v in adapters.values()}
+        all_adapters = [adapter for country_adapters in adapters.values() for adapter in country_adapters]
+        source_counts = {v[0]: 0 for v in all_adapters}
+        source_attempts = {v[0]: 0 for v in all_adapters}
+        source_errors_count = {v[0]: 0 for v in all_adapters}
         warnings: list[str] = []
         current: list[dict] = []
         bikes_by_slug = {b["id"]: b for b in bikes}
@@ -322,40 +347,43 @@ def main() -> int:
             for code in priority:
                 if not countries.get(code, True) or code not in adapters:
                     continue
-                label, func, http_err, url_err = adapters[code]
-                source_attempts[label] += 1
-                try:
-                    raw, _ = func(bike)
-                except http_err as e:
-                    source_errors_count[label] += 1
-                    msg = f"{bike['make']} {bike['model']} / {label}: HTTP {getattr(e, 'code', '?')}"
-                    warnings.append(msg); print("  WARN", msg); continue
-                except url_err as e:
-                    source_errors_count[label] += 1
-                    msg = f"{bike['make']} {bike['model']} / {label}: connection error {getattr(e, 'reason', e)}"
-                    warnings.append(msg); print("  WARN", msg); continue
-                except Exception as e:
-                    source_errors_count[label] += 1
-                    msg = f"{bike['make']} {bike['model']} / {label}: {type(e).__name__}: {e}"
-                    warnings.append(msg); print("  WARN", msg); continue
+                for label, func, http_err, url_err in adapters[code]:
+                    source_attempts[label] += 1
+                    try:
+                        raw, _ = func(bike)
+                    except http_err as e:
+                        source_errors_count[label] += 1
+                        msg = f"{bike['make']} {bike['model']} / {label}: HTTP {getattr(e, 'code', '?')}"
+                        warnings.append(msg); print("  WARN", msg); continue
+                    except url_err as e:
+                        source_errors_count[label] += 1
+                        msg = f"{bike['make']} {bike['model']} / {label}: connection error {getattr(e, 'reason', e)}"
+                        warnings.append(msg); print("  WARN", msg); continue
+                    except Exception as e:
+                        source_errors_count[label] += 1
+                        msg = f"{bike['make']} {bike['model']} / {label}: {type(e).__name__}: {e}"
+                        warnings.append(msg); print("  WARN", msg); continue
 
-                usable = [x for x in raw if valid_listing(x, bike, settings)]
-                unique = {(x.get("source"), str(x.get("source_id"))): x for x in usable}
-                usable = list(unique.values())
-                for x in usable:
-                    key = (str(x["source"]), str(x["source_id"]))
-                    old = existing.get(key)
-                    x["new"] = bool(old is None and not first_baseline)
-                    x["price_drop"] = 0
-                    if old and old.get("price") is not None and int(old["price"]) > int(x["price"]):
-                        x["price_drop"] = int(old["price"]) - int(x["price"])
-                    x["sweet_spot"] = in_sweet_spot(int(x["year"]), bike)
-                    x["score"] = score_listing(x, bike, settings)
-                    x["db_bike_id"] = bike["db_id"]
-                    x.pop("raw_text", None)
-                    current.append(x)
-                source_counts[label] += len(usable)
-                print(f"  {code}: {len(raw)} candidates -> {len(usable)} inside rules")
+                    usable = [x for x in raw if valid_listing(x, bike, settings)]
+                    unique = {(x.get("source"), str(x.get("source_id"))): x for x in usable}
+                    usable = list(unique.values())
+                    for x in usable:
+                        key = (str(x["source"]), str(x["source_id"]))
+                        old = existing.get(key)
+                        # A newly added source gets one silent baseline scan so enabling wider
+                        # coverage does not blast Telegram with every existing advert at once.
+                        source_has_baseline = str(x["source"]) in previous_source_labels
+                        x["new"] = bool(old is None and not first_baseline and source_has_baseline)
+                        x["price_drop"] = 0
+                        if old and old.get("price") is not None and int(old["price"]) > int(x["price"]):
+                            x["price_drop"] = int(old["price"]) - int(x["price"])
+                        x["sweet_spot"] = in_sweet_spot(int(x["year"]), bike)
+                        x["score"] = score_listing(x, bike, settings)
+                        x["db_bike_id"] = bike["db_id"]
+                        x.pop("raw_text", None)
+                        current.append(x)
+                    source_counts[label] += len(usable)
+                    print(f"  {label}: {len(raw)} candidates -> {len(usable)} inside rules")
 
         current_map = {(x["source"], str(x["source_id"])): x for x in current}
         current = list(current_map.values())
