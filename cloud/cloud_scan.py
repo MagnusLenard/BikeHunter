@@ -13,8 +13,8 @@ from marktplaats import HTTPError as MpHTTPError, URLError as MpURLError, search
 from tweedehands import HTTPError as BeHTTPError, URLError as BeURLError, search_bike as search_2dehands
 from autoscout24_de import HTTPError as DeHTTPError, URLError as DeURLError, search_bike as search_autoscout24_de
 from autoscout24_nl import HTTPError as AsNlHTTPError, URLError as AsNlURLError, search_bike as search_autoscout24_nl
-from motoroccasion_nl import HTTPError as MoHTTPError, URLError as MoURLError, search_bike as search_motoroccasion_nl
 from viabovag_nl import HTTPError as BovagHTTPError, URLError as BovagURLError, search_bike as search_viabovag_nl
+from bikenet_nl import HTTPError as BikeNetHTTPError, URLError as BikeNetURLError, search_bike as search_bikenet_nl
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
@@ -311,6 +311,10 @@ def main() -> int:
                     previous_counts = {}
             if isinstance(previous_counts, dict):
                 previous_source_labels = set(previous_counts.keys())
+        # Motoroccasion blocks the GitHub cloud runner. It is retired in favor of BikeNet
+        # dealer coverage; deactivate any historical Motoroccasion rows so they do not linger.
+        sb_request("PATCH", "listings?source=eq.Motoroccasion%20NL", {"active": False}, "return=minimal")
+
         existing_rows = sb_request("GET", "listings?select=source,external_id,price,bike_id,first_seen&limit=1000") or []
         existing = {(r["source"], str(r["external_id"])): r for r in existing_rows}
 
@@ -322,7 +326,7 @@ def main() -> int:
             "NL": [
                 ("Marktplaats NL", search_marktplaats, MpHTTPError, MpURLError),
                 ("AutoScout24 NL", search_autoscout24_nl, AsNlHTTPError, AsNlURLError),
-                ("Motoroccasion NL", search_motoroccasion_nl, MoHTTPError, MoURLError),
+                ("BikeNet Dealers NL", search_bikenet_nl, BikeNetHTTPError, BikeNetURLError),
                 ("viaBOVAG NL", search_viabovag_nl, BovagHTTPError, BovagURLError),
             ],
             "BE": [
