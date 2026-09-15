@@ -6,24 +6,25 @@ import ssl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote_plus, urlencode, urljoin, urlparse
+from urllib.parse import unquote, unquote_plus, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from marktplaats import detect_features, extract_first_image, relevant, strip_tags
 
+# BikeNet currently has two public front ends:
+# - www.bikenet.nl: current site, valid TLS, good for detail pages
+# - www2.bikenet.nl: legacy SEO inventory pages, still live but its TLS cert is expired
+#
+# The legacy inventory pages are the only ones that expose stable brand/type indexes such as
+# /occasions/honda/cb-750/. We therefore use www2 ONLY to read public index pages, with TLS
+# verification disabled for that host only, and immediately rewrite every detail URL to the
+# current www.bikenet.nl host where normal TLS verification remains enabled.
 BASE = "https://www.bikenet.nl"
+INDEX_BASE = "https://www2.bikenet.nl"
 SEARCH_PATH = "/occasions/"
 
-# BikeNet's public inventory uses canonical brand/type paths.
-# Use www.bikenet.nl: the legacy www2 host currently presents an expired TLS certificate
-# to Python/GitHub Actions, while the primary www host serves the same public inventory
-# with a valid certificate. Keep TLS verification enabled rather than bypassing it.  The earlier V2
-# used exact ?merk=&type= query values such as "cbr 600 f".  BikeNet groups
-# variants under broader type names (for example CBR 600), so those exact
-# query values could return a valid page with zero listing links.
-#
-# Keep one or more canonical paths per watched model and then use the strict
-# title matcher below to separate F/RR, Hornet/non-Hornet, etc.
+# BikeNet groups variants under broad type buckets. Strict title matching later separates
+# CBR600F vs CBR600RR, etc.
 MODEL_PATHS = {
     "honda-cbr600f": ["honda/cbr-600"],
     "honda-cbr600rr": ["honda/cbr-600"],
@@ -37,11 +38,9 @@ MODEL_PATHS = {
     "triumph-daytona-675": ["triumph/daytona-675"],
     "suzuki-gsxr600": ["suzuki/gsx-r-600"],
     "aprilia-rs660": ["aprilia/rs-660"],
-    # BikeNet currently places Hornet stock under both CB 750 and Hornet 750.
     "honda-hornet-750": ["honda/cb-750", "honda/hornet-750"],
 }
 
-# Fallback query labels for future models that are not yet in MODEL_PATHS.
 MODEL_TYPES = {
     "honda-cbr600f": "cbr 600",
     "honda-cbr600rr": "cbr 600",
@@ -72,8 +71,8 @@ class HrefCollector(HTMLParser):
             self.hrefs.append(href)
 
 
-def fetch(url: str) -> str:
-    req = Request(url, headers={
+def _request(url: str) -> Request:
+    return Request(url, headers={
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -84,7 +83,14 @@ def fetch(url: str) -> str:
         "Accept-Encoding": "identity",
         "Cache-Control": "no-cache",
     })
-    with urlopen(req, timeout=35, context=ssl.create_default_context()) as response:
+
+
+def fetch(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    # Narrow exception for BikeNet's legacy *public index* host. No credentials, cookies,
+    # tokens, POST bodies or private data are ever sent here.
+    context = ssl._create_unverified_context() if host == "www2.bikenet.nl" else ssl.create_default_context()
+    with urlopen(_request(url), timeout=35, context=context) as response:
         raw = response.read()
         charset = response.headers.get_content_charset() or "utf-8"
         return raw.decode(charset, errors="replace")
@@ -131,41 +137,58 @@ def search_type_for(bike: dict) -> str:
     return " ".join(model.split()).lower()
 
 
-def search_urls(bike: dict, page: int = 1) -> list[str]:
+def _index_urls(bike: dict, page: int = 1) -> list[str]:
     bid = str(bike.get("id", ""))
     paths = MODEL_PATHS.get(bid) or []
     page = max(1, int(page))
-    if paths:
-        urls = []
-        for path in paths:
-            base = f"{BASE}{SEARCH_PATH}{path.strip('/')}/"
-            urls.append(base if page == 1 else base + "?" + urlencode({"pagina": page}))
-        return urls
-
-    # Unknown future models retain a generic BikeNet query fallback.
-    params = {
-        "merk": str(bike.get("make") or "").strip().lower(),
-        "pagina": page,
-        "type": search_type_for(bike),
-    }
-    return [BASE + SEARCH_PATH + "?" + urlencode(params)]
+    urls: list[str] = []
+    for path in paths:
+        base = f"{INDEX_BASE}{SEARCH_PATH}{path.strip('/')}/"
+        urls.append(base if page == 1 else base + "?" + urlencode({"pagina": page}))
+    return urls
 
 
-def listing_links(page: str) -> list[str]:
+def _brand_url(bike: dict, page: int = 1) -> str:
+    brand = re.sub(r"[^a-z0-9-]", "", str(bike.get("make") or "").strip().lower().replace(" ", "-"))
+    page = max(1, int(page))
+    base = f"{INDEX_BASE}{SEARCH_PATH}{brand}/"
+    return base if page == 1 else base + "?" + urlencode({"pagina": page})
+
+
+def _canonical_detail_url(href: str) -> str | None:
+    h = html_lib.unescape(href).replace("\\/", "/").strip()
+    low = h.lower()
+    if "/occasion/" not in low or "/occasions/" in low:
+        return None
+    # Resolve against the legacy index, then keep only BikeNet-owned detail paths.
+    parsed = urlparse(urljoin(INDEX_BASE, h).split("#", 1)[0])
+    host = (parsed.hostname or "").lower()
+    if not (host == "bikenet.nl" or host.endswith(".bikenet.nl")):
+        return None
+    if "/occasion/" not in parsed.path.lower():
+        return None
+    # Always fetch details from the current valid-TLS host.
+    suffix = parsed.path
+    if parsed.query:
+        suffix += "?" + parsed.query
+    return BASE + suffix
+
+
+def listing_links(page: str, bike: dict | None = None) -> list[str]:
     parser = HrefCollector()
     parser.feed(page)
     out: list[str] = []
     seen: set[str] = set()
     for href in parser.hrefs:
-        h = html_lib.unescape(href).replace("\\/", "/").strip()
-        low = h.lower()
-        if "/occasion/" not in low or "/occasions/" in low:
+        url = _canonical_detail_url(href)
+        if not url:
             continue
-        url = urljoin(BASE, h).split("#", 1)[0]
-        # Keep only BikeNet-owned detail URLs. BikeNet sometimes links dealer sites too.
-        host = (urlparse(url).hostname or "").lower()
-        if not (host == "bikenet.nl" or host.endswith(".bikenet.nl")):
-            continue
+        # BikeNet detail URLs contain the make/model slug. This cheap pre-filter is especially
+        # useful when we have to fall back to a whole-brand page.
+        if bike is not None:
+            path_hint = unquote(urlparse(url).path).replace("-", " ")
+            if not strict_model_match(path_hint, bike):
+                continue
         if url not in seen:
             seen.add(url)
             out.append(url)
@@ -198,7 +221,6 @@ def parse_detail(page: str, url: str, bike: dict) -> dict | None:
             if value is not None and 100 <= value <= 100000:
                 values.append(value)
         if values:
-            # BikeNet may show Van/Voor prices; the final euro amount is the live price.
             price = values[-1]
     if price is None:
         m = re.search(r"€\s*([0-9]{1,3}(?:[.\s][0-9]{3})+|[0-9]{3,6})(?:,[0-9]{2})?", text)
@@ -220,15 +242,22 @@ def parse_detail(page: str, url: str, bike: dict) -> dict | None:
             mileage = None
 
     seller = "BikeNet dealer"
-    # Detail pages link back to a dealer-filtered BikeNet page using ?dealer=...&naam=Dealer+Name.
     m = re.search(r"[?&]naam=([^&\"'<>]+)", page, flags=re.I)
     if m:
         candidate = unquote_plus(html_lib.unescape(m.group(1))).strip()
         if candidate:
             seller = candidate[:120]
+    if seller == "BikeNet dealer":
+        # Current detail layout commonly places the dealer in an h2/h3 near its address.
+        candidates = re.findall(r"<(?:h2|h3)\b[^>]*>(.*?)</(?:h2|h3)>", page, flags=re.I | re.S)
+        for raw in reversed(candidates):
+            candidate = strip_tags(raw).strip()
+            if candidate and not candidate.lower().startswith(("andere interessante", "omschrijving", "voertuig")):
+                if len(candidate) <= 120:
+                    seller = candidate
+                    break
 
     location = "Netherlands"
-    # Best-effort dealer postcode; avoiding over-parsing keeps false towns out.
     m = re.search(r"\b(\d{4}\s?[A-Z]{2})\b", text)
     if m:
         location = f"NL-{m.group(1).replace(' ', '')}"
@@ -254,30 +283,72 @@ def parse_detail(page: str, url: str, bike: dict) -> dict | None:
     }
 
 
-def search_bike(bike: dict) -> tuple[list[dict], str]:
-    first_urls = search_urls(bike, 1)
-    first_url = first_urls[0]
-    links: list[str] = []
+def _collect_model_links(bike: dict) -> tuple[list[str], str]:
+    first_urls = _index_urls(bike, 1)
+    first_url = first_urls[0] if first_urls else _brand_url(bike, 1)
     seen: set[str] = set()
+    links: list[str] = []
+    successful_index_fetch = False
 
-    # Canonical model pages are usually short. Check up to three pages for each
-    # mapped BikeNet type; strict_model_match() filters shared type buckets.
+    # Preferred: BikeNet's type-specific legacy index. Usually only one page is needed, but
+    # allow three for busy buckets such as CBR 600.
     for page_no in range(1, 4):
         page_added = 0
-        for url in search_urls(bike, page_no):
-            page = fetch(url)
-            low = page.lower()
-            if "bikenet" not in low or len(page) < 1500:
-                raise ValueError("BikeNet returned an unrecognized page")
-            page_links = listing_links(page)
-            for detail_url in page_links:
+        urls = _index_urls(bike, page_no)
+        if not urls:
+            break
+        for url in urls:
+            try:
+                page = fetch(url)
+            except HTTPError as exc:
+                if exc.code == 404:
+                    continue
+                raise
+            successful_index_fetch = True
+            if "bikenet" not in page.lower() or len(page) < 1200:
+                continue
+            for detail_url in listing_links(page, bike):
                 if detail_url not in seen:
                     seen.add(detail_url)
                     links.append(detail_url)
                     page_added += 1
-        if page_added == 0:
+        if page_no > 1 and page_added == 0:
             break
 
+    if links:
+        return links, first_url
+
+    # Fallback: whole-brand legacy index. This handles an occasional missing/renamed type route.
+    # URLs themselves contain model slugs, so unrelated listings are discarded before detail fetches.
+    for page_no in range(1, 13):
+        url = _brand_url(bike, page_no)
+        try:
+            page = fetch(url)
+        except HTTPError as exc:
+            if exc.code == 404 and page_no == 1:
+                if successful_index_fetch:
+                    break
+                raise
+            if exc.code == 404:
+                break
+            raise
+        if "bikenet" not in page.lower() or len(page) < 1200:
+            break
+        page_links = listing_links(page, bike)
+        new_count = 0
+        for detail_url in page_links:
+            if detail_url not in seen:
+                seen.add(detail_url)
+                links.append(detail_url)
+                new_count += 1
+        if page_no > 1 and new_count == 0:
+            break
+
+    return links, first_url
+
+
+def search_bike(bike: dict) -> tuple[list[dict], str]:
+    links, first_url = _collect_model_links(bike)
     listings: list[dict] = []
     completed = 0
 
