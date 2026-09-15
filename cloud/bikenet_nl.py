@@ -11,21 +11,44 @@ from urllib.request import Request, urlopen
 
 from marktplaats import detect_features, extract_first_image, relevant, strip_tags
 
-BASE = "https://bikenet.nl"
+BASE = "https://www2.bikenet.nl"
 SEARCH_PATH = "/occasions/"
 
-# BikeNet's public search accepts merk + type. These values match the type names
-# used by the dealer inventory. Unknown bikes fall back to the dashboard model.
+# BikeNet's public inventory uses canonical brand/type paths.  The earlier V2
+# used exact ?merk=&type= query values such as "cbr 600 f".  BikeNet groups
+# variants under broader type names (for example CBR 600), so those exact
+# query values could return a valid page with zero listing links.
+#
+# Keep one or more canonical paths per watched model and then use the strict
+# title matcher below to separate F/RR, Hornet/non-Hornet, etc.
+MODEL_PATHS = {
+    "honda-cbr600f": ["honda/cbr-600"],
+    "honda-cbr600rr": ["honda/cbr-600"],
+    "honda-cbr650r": ["honda/cbr-650"],
+    "honda-cbr500r": ["honda/cbr-500"],
+    "yamaha-r3": ["yamaha/yzf-r3"],
+    "yamaha-r6": ["yamaha/yzf-r6"],
+    "yamaha-r7": ["yamaha/yzf-r7"],
+    "honda-rebel500": ["honda/cmx-500"],
+    "triumph-street-triple-675": ["triumph/street-triple"],
+    "triumph-daytona-675": ["triumph/daytona-675"],
+    "suzuki-gsxr600": ["suzuki/gsx-r-600"],
+    "aprilia-rs660": ["aprilia/rs-660"],
+    # BikeNet currently places Hornet stock under both CB 750 and Hornet 750.
+    "honda-hornet-750": ["honda/cb-750", "honda/hornet-750"],
+}
+
+# Fallback query labels for future models that are not yet in MODEL_PATHS.
 MODEL_TYPES = {
-    "honda-cbr600f": "cbr 600 f",
-    "honda-cbr600rr": "cbr 600 rr",
-    "honda-cbr650r": "cbr 650 r",
-    "honda-cbr500r": "cbr 500 r",
+    "honda-cbr600f": "cbr 600",
+    "honda-cbr600rr": "cbr 600",
+    "honda-cbr650r": "cbr 650",
+    "honda-cbr500r": "cbr 500",
     "yamaha-r3": "yzf r3",
     "yamaha-r6": "yzf r6",
     "yamaha-r7": "yzf r7",
     "honda-rebel500": "cmx 500",
-    "triumph-street-triple-675": "street triple 675",
+    "triumph-street-triple-675": "street triple",
     "triumph-daytona-675": "daytona 675",
     "suzuki-gsxr600": "gsx r 600",
     "aprilia-rs660": "rs 660",
@@ -105,13 +128,24 @@ def search_type_for(bike: dict) -> str:
     return " ".join(model.split()).lower()
 
 
-def search_url(bike: dict, page: int = 1) -> str:
+def search_urls(bike: dict, page: int = 1) -> list[str]:
+    bid = str(bike.get("id", ""))
+    paths = MODEL_PATHS.get(bid) or []
+    page = max(1, int(page))
+    if paths:
+        urls = []
+        for path in paths:
+            base = f"{BASE}{SEARCH_PATH}{path.strip('/')}/"
+            urls.append(base if page == 1 else base + "?" + urlencode({"pagina": page}))
+        return urls
+
+    # Unknown future models retain a generic BikeNet query fallback.
     params = {
         "merk": str(bike.get("make") or "").strip().lower(),
-        "pagina": max(1, int(page)),
+        "pagina": page,
         "type": search_type_for(bike),
     }
-    return BASE + SEARCH_PATH + "?" + urlencode(params)
+    return [BASE + SEARCH_PATH + "?" + urlencode(params)]
 
 
 def listing_links(page: str) -> list[str]:
@@ -218,28 +252,27 @@ def parse_detail(page: str, url: str, bike: dict) -> dict | None:
 
 
 def search_bike(bike: dict) -> tuple[list[dict], str]:
-    first_url = search_url(bike, 1)
+    first_urls = search_urls(bike, 1)
+    first_url = first_urls[0]
     links: list[str] = []
     seen: set[str] = set()
 
-    # Exact model searches are normally one page. Check up to three pages so a popular
-    # model is still fully covered without crawling BikeNet's entire national inventory.
+    # Canonical model pages are usually short. Check up to three pages for each
+    # mapped BikeNet type; strict_model_match() filters shared type buckets.
     for page_no in range(1, 4):
-        url = search_url(bike, page_no)
-        page = fetch(url)
-        low = page.lower()
-        if "bikenet" not in low or len(page) < 1500:
-            raise ValueError("BikeNet returned an unrecognized page")
-        page_links = listing_links(page)
-        if not page_links:
-            break
-        added = 0
-        for detail_url in page_links:
-            if detail_url not in seen:
-                seen.add(detail_url)
-                links.append(detail_url)
-                added += 1
-        if added == 0:
+        page_added = 0
+        for url in search_urls(bike, page_no):
+            page = fetch(url)
+            low = page.lower()
+            if "bikenet" not in low or len(page) < 1500:
+                raise ValueError("BikeNet returned an unrecognized page")
+            page_links = listing_links(page)
+            for detail_url in page_links:
+                if detail_url not in seen:
+                    seen.add(detail_url)
+                    links.append(detail_url)
+                    page_added += 1
+        if page_added == 0:
             break
 
     listings: list[dict] = []

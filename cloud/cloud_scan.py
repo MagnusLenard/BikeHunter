@@ -382,9 +382,11 @@ def main() -> int:
                     for x in usable:
                         key = (str(x["source"]), str(x["source_id"]))
                         old = existing.get(key)
-                        # A newly added source gets one silent baseline scan so enabling wider
-                        # coverage does not blast Telegram with every existing advert at once.
-                        source_has_baseline = str(x["source"]) in previous_source_labels
+                        # A newly added source gets one silent *successful* baseline scan so
+                        # enabling wider coverage does not blast Telegram with every existing
+                        # advert at once.  Use stored rows rather than only the scan label: a
+                        # broken first scan can legitimately record the source with count 0.
+                        source_has_baseline = any(src == str(x["source"]) for src, _ in existing.keys())
                         x["new"] = bool(old is None and not first_baseline and source_has_baseline)
                         x["price_drop"] = 0
                         if old and old.get("price") is not None and int(old["price"]) > int(x["price"]):
