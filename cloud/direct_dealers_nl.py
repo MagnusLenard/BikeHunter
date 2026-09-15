@@ -217,39 +217,64 @@ def _parse_price(text: str) -> int | None:
     return min(values) if values else None
 
 
-def _product_candidates(page: str, bike: dict) -> list[tuple[str, int]]:
+def _product_candidates(page: str, bike: dict) -> list[tuple[str, int | None]]:
+    # V3 required a price from a guessed card fragment, which silently dropped
+    # real products. V4 identifies the actual stock-unit URL first and verifies
+    # price/year on the detail page.
     blocked = (
         "/motoren/", "/blog", "/technische-tekeningen", "/winkel", "/contact",
         "/werkplaats", "/verhuur", "/klantenservice", "/account", "/checkout",
         "/catalogsearch", "/media/", "/static/",
     )
-    out: list[tuple[str, int]] = []
+    out: list[tuple[str, int | None]] = []
     seen: set[str] = set()
-    limit = int(bike.get("max_price_eur") or 999999)
 
     for url, anchor in _extract_links(page):
-        path = unquote(urlparse(url).path).lower()
+        path = unquote(urlparse(url).path).lower().rstrip("/")
         if path in ("", "/") or any(path.startswith(x) for x in blocked):
             continue
+        if not strict_model_match(anchor, bike):
+            continue
+
         fragment = _card_fragment(page, url)
         card_text = strip_tags(fragment)
-        combined = f"{anchor} {card_text}"
-        if not strict_model_match(combined, bike):
+        tail = path.rsplit("/", 1)[-1]
+        stock_like = bool(re.search(r"(?:^|-)rhc[0-9a-z-]+$", tail, flags=re.I))
+        occasion_like = "occasion" in card_text.lower()
+        if not stock_like and not occasion_like:
             continue
+
         price = _parse_price(card_text)
-        # On Goedhart's occasion category pages, a real motorcycle card contains a
-        # visible asking price. Requiring it filters navigation/parts links.
-        if price is None:
-            continue
-        # Do not open detail pages for bikes that are already outside BikeHunter's
-        # configured ceiling. This also avoids pointless requests and rate limits.
-        if price > limit or price < 500:
-            continue
         if url not in seen:
             seen.add(url)
             out.append((url, price))
     return out
 
+
+def _max_index_pages(page: str) -> int:
+    nums = [int(x) for x in re.findall(r"(?:[?&]|&amp;)p=(\d+)", page, flags=re.I)]
+    return max(1, min(max(nums, default=1), 10))
+
+
+def _structured_price(page: str) -> int | None:
+    patterns = (
+        r"itemprop=[\"']price[\"'][^>]*content=[\"']([0-9]+(?:[.,][0-9]+)?)[\"']",
+        r"content=[\"']([0-9]+(?:[.,][0-9]+)?)[\"'][^>]*itemprop=[\"']price[\"']",
+        r"data-price-amount=[\"']([0-9]+(?:[.,][0-9]+)?)[\"']",
+        r"[\"']price[\"']\s*:\s*[\"']?([0-9]+(?:[.,][0-9]+)?)",
+    )
+    for pat in patterns:
+        m = re.search(pat, page, flags=re.I)
+        if not m:
+            continue
+        raw = m.group(1).replace(",", ".")
+        try:
+            value = int(round(float(raw)))
+        except ValueError:
+            continue
+        if 500 <= value <= 100000:
+            return value
+    return None
 
 def _field(text: str, label: str, pattern: str) -> str | None:
     m = re.search(rf"\b{re.escape(label)}\s*:?\s*({pattern})", text, flags=re.I)
@@ -281,7 +306,11 @@ def parse_detail(page: str, url: str, bike: dict, card_price: int | None = None)
     title = _extract_title(page, text, bike)
     if not title:
         return None
-    price = _parse_price(text) or card_price
+    condition_match = re.search(r"\bConditie\s*:?[\s|]*(Occasion|Gebruikt|Nieuw)\b", text, flags=re.I)
+    if condition_match and condition_match.group(1).lower() == "nieuw":
+        return None
+
+    price = card_price or _structured_price(page) or _parse_price(text)
 
     year = None
     for label in ("Bouwjaar", "Modeljaar"):
@@ -317,19 +346,30 @@ def parse_detail(page: str, url: str, bike: dict, card_price: int | None = None)
 
 
 def search_goedhart(bike: dict) -> tuple[list[dict], str]:
-    index_url = _index_url(bike, 1)
-    if index_url not in _PAGE_CACHE:
-        _PAGE_CACHE[index_url] = fetch(index_url, retries=1)
-    page = _PAGE_CACHE[index_url]
+    first_url = _index_url(bike, 1)
+    if first_url not in _PAGE_CACHE:
+        _PAGE_CACHE[first_url] = fetch(first_url, retries=1)
+    first_page = _PAGE_CACHE[first_url]
 
-    candidates = _product_candidates(page, bike)
+    page_count = _max_index_pages(first_page)
+    candidate_map: dict[str, int | None] = {}
+
+    for page_no in range(1, page_count + 1):
+        index_url = _index_url(bike, page_no)
+        if index_url not in _PAGE_CACHE:
+            time.sleep(0.20)
+            _PAGE_CACHE[index_url] = fetch(index_url, retries=1)
+        for url, card_price in _product_candidates(_PAGE_CACHE[index_url], bike):
+            if url not in candidate_map or candidate_map[url] is None:
+                candidate_map[url] = card_price
+
     listings: list[dict] = []
     failed = 0
-    for url, card_price in candidates[:30]:
+    for url, card_price in list(candidate_map.items())[:40]:
         try:
             if url not in _DETAIL_CACHE:
-                time.sleep(0.35)
-                _DETAIL_CACHE[url] = fetch(url, referer=index_url, retries=1)
+                time.sleep(0.30)
+                _DETAIL_CACHE[url] = fetch(url, referer=first_url, retries=1)
             item = parse_detail(_DETAIL_CACHE[url], url, bike, card_price)
         except (HTTPError, URLError) as exc:
             failed += 1
@@ -341,10 +381,11 @@ def search_goedhart(bike: dict) -> tuple[list[dict], str]:
 
     unique = {x["source_id"]: x for x in listings}
     print(
-        f"  {GOEDHART.source}: {len(candidates)} affordable matching card(s) -> "
-        f"{len(unique)} parsed" + (f" ({failed} detail fetch failed)" if failed else "")
+        f"  {GOEDHART.source}: scanned {page_count} catalogue page(s), "
+        f"{len(candidate_map)} matching stock-unit link(s) -> {len(unique)} parsed"
+        + (f" ({failed} detail fetch failed)" if failed else "")
     )
-    return list(unique.values()), index_url
+    return list(unique.values()), first_url
 
 
 __all__ = ["HTTPError", "URLError", "search_goedhart", "strict_model_match", "parse_detail"]
