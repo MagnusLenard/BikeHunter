@@ -14,6 +14,12 @@ from tweedehands import HTTPError as BeHTTPError, URLError as BeURLError, search
 from autoscout24_de import HTTPError as DeHTTPError, URLError as DeURLError, search_bike as search_autoscout24_de
 from autoscout24_nl import HTTPError as AsNlHTTPError, URLError as AsNlURLError, search_bike as search_autoscout24_nl
 from viabovag_nl import HTTPError as BovagHTTPError, URLError as BovagURLError, search_bike as search_viabovag_nl
+from direct_dealers_nl import (
+    HTTPError as DealerHTTPError,
+    URLError as DealerURLError,
+    search_arie_molenaar,
+    search_goedhart,
+)
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
@@ -326,6 +332,8 @@ def main() -> int:
                 ("Marktplaats NL", search_marktplaats, MpHTTPError, MpURLError),
                 ("AutoScout24 NL", search_autoscout24_nl, AsNlHTTPError, AsNlURLError),
                 ("viaBOVAG NL", search_viabovag_nl, BovagHTTPError, BovagURLError),
+                ("Arie Molenaar Motors NL", search_arie_molenaar, DealerHTTPError, DealerURLError),
+                ("Goedhart Motoren NL", search_goedhart, DealerHTTPError, DealerURLError),
             ],
             "BE": [
                 ("2dehands BE", search_2dehands, BeHTTPError, BeURLError),
