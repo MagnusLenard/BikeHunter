@@ -171,15 +171,48 @@ def _label_value(text: str, label: str, stop_labels: tuple[str, ...]) -> str | N
     return " ".join(m.group(1).split()) if m else None
 
 
+def _matching_title(page: str, text: str, bike: dict) -> str | None:
+    # The current BikeNet detail frontend often places generic H1s such as
+    # "Proefrit aanvragen" before the actual vehicle heading.  Taking the first H1
+    # therefore silently discarded every valid listing.  Inspect all headings and
+    # keep the first one that actually matches the watched motorcycle.
+    heading_candidates: list[str] = []
+    for raw in re.findall(r"<h[1-3]\b[^>]*>(.*?)</h[1-3]>", page, flags=re.I | re.S):
+        candidate = strip_tags(raw).strip()
+        if candidate and candidate not in heading_candidates:
+            heading_candidates.append(candidate)
+
+    # Some BikeNet layouts split make and model into separate headings.  A model-only
+    # heading such as "YZF-R7" or "CBR 650 R ABS" is enough for strict_model_match.
+    for candidate in heading_candidates:
+        if strict_model_match(candidate, bike):
+            return candidate
+
+    # Structured labels are more stable than page-title boilerplate and also work when
+    # the visual heading is split across multiple tags.
+    make_value = _label_value(text, "Merk", ("Type", "Bouwjaar", "Kilometerstand", "Garantie"))
+    type_value = _label_value(text, "Type", ("Bouwjaar", "Kilometerstand", "Garantie", "Kleur"))
+    if type_value:
+        combined = " ".join(x for x in (make_value, type_value) if x).strip()
+        if combined and strict_model_match(combined, bike):
+            return combined
+        if strict_model_match(type_value, bike):
+            return type_value
+
+    # Last resort: only accept the HTML title when it really identifies the bike.
+    m = re.search(r"<title\b[^>]*>(.*?)</title>", page, flags=re.I | re.S)
+    if m:
+        candidate = strip_tags(m.group(1)).strip()
+        if candidate and strict_model_match(candidate, bike):
+            return candidate
+    return None
+
+
 def parse_detail(page: str, url: str, bike: dict) -> dict | None:
     text = strip_tags(page)
 
-    m = re.search(r"<h1\b[^>]*>(.*?)</h1>", page, flags=re.I | re.S)
-    title = strip_tags(m.group(1)).strip() if m else None
+    title = _matching_title(page, text, bike)
     if not title:
-        m = re.search(r"<title\b[^>]*>(.*?)</title>", page, flags=re.I | re.S)
-        title = strip_tags(m.group(1)).strip() if m else None
-    if not title or not strict_model_match(title, bike):
         return None
 
     price = None
@@ -311,6 +344,7 @@ def _fetch_detail(url: str) -> str:
 
 def search_bike(bike: dict) -> tuple[list[dict], str]:
     links, first_url = _collect_links(bike)
+    print(f"    BikeNet: {len(links)} matching detail links for {bike.get('make')} {bike.get('model')}")
     listings: list[dict] = []
     completed = 0
 
@@ -336,7 +370,9 @@ def search_bike(bike: dict) -> tuple[list[dict], str]:
         raise ValueError("BikeNet detail pages could not be fetched")
 
     unique = {x["source_id"]: x for x in listings}
-    return list(unique.values()), first_url
+    parsed = list(unique.values())
+    print(f"    BikeNet: {len(parsed)} parsed listings for {bike.get('make')} {bike.get('model')}")
+    return parsed, first_url
 
 
 __all__ = ["HTTPError", "URLError", "search_bike"]
