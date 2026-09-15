@@ -194,8 +194,29 @@ def match_terms_for(bike: dict) -> list[str]:
 
 def relevant(text: str, bike: dict) -> bool:
     t = norm(text)
+    bid = str(bike.get("id", ""))
+    # Dutch sellers often write the current Hornet as "CB 750 Hornet" while
+    # BikeHunter stores it as "Hornet 750".  Normal substring matching misses
+    # that reversed word order, so handle the model explicitly.
+    if bid == "honda-hornet-750":
+        return "hornet" in t and "750" in t
     terms = match_terms_for(bike)
     return any(term in t for term in terms)
+
+
+def search_queries_for(bike: dict) -> list[str]:
+    primary = str(bike.get("query") or f"{bike['make']} {bike['model']}")
+    queries = [primary]
+    if str(bike.get("id", "")) == "honda-hornet-750":
+        queries += ["Honda CB 750 Hornet", "Honda CB750 Hornet"]
+    out = []
+    seen = set()
+    for q in queries:
+        key = q.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(q.strip())
+    return out
 
 
 
@@ -256,57 +277,65 @@ def detect_features(text: str) -> list[str]:
 
 def search_bike(bike: dict) -> tuple[list[dict], str]:
     make_slug = slug(str(bike["make"]))
-    query = str(bike.get("query") or f"{bike['make']} {bike['model']}")
     min_year = int(bike.get("min_year", 2011))
     max_year = int(bike.get("max_year", 2026))
-    url = f"{BASE}/l/motoren/motoren-{make_slug}/q/{query_slug(query)}/"
-    page = fetch(url)
+    del min_year, max_year  # normal validation happens in cloud_scan.py
 
-    parser = LinkCollector()
-    parser.feed(page)
-    expected_path = f"/v/motoren/motoren-{make_slug}/"
-    all_links = [x for x in parser.links if expected_path in x.href and re.search(r"\bm\d+\b", x.href)]
-
-    grouped: dict[str, list[Link]] = {}
-    href_by_id: dict[str, str] = {}
-    for link in all_links:
-        lid = listing_id(link.href)
-        grouped.setdefault(lid, []).append(link)
-        href_by_id.setdefault(lid, link.href)
-
-    listings = []
-    for lid, links in grouped.items():
-        href = href_by_id[lid]
-        fragment = card_fragment(page, href)
-        text = strip_tags(fragment)
-        title = choose_title(links, href)
-        combined = f"{title} {text}"
-        if not relevant(combined, bike):
+    merged: dict[str, dict] = {}
+    first_url = ""
+    for qi, query in enumerate(search_queries_for(bike)):
+        url = f"{BASE}/l/motoren/motoren-{make_slug}/q/{query_slug(query)}/"
+        if not first_url:
+            first_url = url
+        try:
+            page = fetch(url)
+        except (HTTPError, URLError):
+            if qi == 0:
+                raise
             continue
-        full_url = href if href.startswith("http") else BASE + href
-        # The card body may contain unrelated euro amounts (financing, nearby-card text,
-        # accessories, etc.). When the listing title itself contains the asking price,
-        # that is the most reliable value. Fall back to the card body only if needed.
-        title_price = parse_price(title)
-        body_price = parse_price(text)
-        asking_price = title_price if title_price is not None else body_price
-        listings.append({
-            "source_id": lid,
-            "bike_id": bike["id"],
-            "title": title,
-            "price": asking_price,
-            "year": parse_year(title, text),
-            "km": parse_km(text),
-            "location": "Netherlands",
-            "seller": "Marktplaats",
-            "source": "Marktplaats NL",
-            "country": "NL",
-            "url": full_url,
-            "image_url": extract_first_image(fragment),
-            "features": detect_features(combined),
-            "raw_text": text[:800],
-        })
-    return listings, url
+
+        parser = LinkCollector()
+        parser.feed(page)
+        expected_path = f"/v/motoren/motoren-{make_slug}/"
+        all_links = [x for x in parser.links if expected_path in x.href and re.search(r"\bm\d+\b", x.href)]
+
+        grouped: dict[str, list[Link]] = {}
+        href_by_id: dict[str, str] = {}
+        for link in all_links:
+            lid = listing_id(link.href)
+            grouped.setdefault(lid, []).append(link)
+            href_by_id.setdefault(lid, link.href)
+
+        for lid, links in grouped.items():
+            href = href_by_id[lid]
+            fragment = card_fragment(page, href)
+            text = strip_tags(fragment)
+            title = choose_title(links, href)
+            combined = f"{title} {text}"
+            if not relevant(combined, bike):
+                continue
+            full_url = href if href.startswith("http") else BASE + href
+            title_price = parse_price(title)
+            body_price = parse_price(text)
+            asking_price = title_price if title_price is not None else body_price
+            merged[lid] = {
+                "source_id": lid,
+                "bike_id": bike["id"],
+                "title": title,
+                "price": asking_price,
+                "year": parse_year(title, text),
+                "km": parse_km(text),
+                "location": "Netherlands",
+                "seller": "Marktplaats",
+                "source": "Marktplaats NL",
+                "country": "NL",
+                "url": full_url,
+                "image_url": extract_first_image(fragment),
+                "features": detect_features(combined),
+                "raw_text": text[:800],
+            }
+
+    return list(merged.values()), first_url
 
 
 __all__ = ["HTTPError", "URLError", "search_bike"]

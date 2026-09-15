@@ -4,13 +4,15 @@ import hashlib
 import html as html_lib
 import re
 import ssl
+import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from http.cookiejar import CookieJar
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPCookieProcessor, HTTPSHandler, Request, build_opener
 
-from marktplaats import detect_features, extract_first_image, relevant, strip_tags
+from marktplaats import detect_features, extract_first_image, strip_tags
 
 
 @dataclass(frozen=True)
@@ -20,57 +22,55 @@ class Dealer:
     name: str
     base: str
     city: str
-    max_pages: int
-    index_kind: str
 
 
-# IMPORTANT: use the dealers' canonical public HTTPS sites.
-# The old occasions.<dealer>.nl hosts currently present certificates that do not
-# match those hostnames, so Python correctly rejects them. Both dealers expose
-# their inventory on the main, valid-certificate domains as well.
-DEALERS = {
-    "arie": Dealer(
-        key="arie",
-        source="Arie Molenaar Motors NL",
-        name="Arie Molenaar Motors B.V.",
-        base="https://www.ariemolenaarmotors.nl",
-        city="IJsselstein",
-        max_pages=15,
-        index_kind="arie",
-    ),
-    "goedhart": Dealer(
-        key="goedhart",
-        source="Goedhart Motoren NL",
-        name="Goedhart Motoren B.V.",
-        base="https://www.goedhartmotoren.nl",
-        city="Bodegraven",
-        max_pages=40,
-        index_kind="goedhart",
-    ),
-}
+GOEDHART = Dealer(
+    key="goedhart",
+    source="Goedhart Motoren NL",
+    name="Goedhart Motoren B.V.",
+    base="https://www.goedhartmotoren.nl",
+    city="Bodegraven",
+)
+
+# Keep a normal browser-like session. This cuts request volume and preserves any
+# cookies Goedhart sets while we inspect its public occasion catalogue.
+_COOKIE_JAR = CookieJar()
+_OPENER = build_opener(
+    HTTPCookieProcessor(_COOKIE_JAR),
+    HTTPSHandler(context=ssl.create_default_context()),
+)
+_PAGE_CACHE: dict[str, str] = {}
+_DETAIL_CACHE: dict[str, str] = {}
 
 
-class HrefCollector(HTMLParser):
+class LinkCollector(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.hrefs: list[str] = []
+        self.links: list[tuple[str, str]] = []
+        self._href: str | None = None
+        self._text: list[str] = []
 
     def handle_starttag(self, tag, attrs):
         if tag.lower() != "a":
             return
         href = dict(attrs).get("href")
         if href:
-            self.hrefs.append(href)
+            self._href = href
+            self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "a" and self._href is not None:
+            self.links.append((self._href, " ".join(" ".join(self._text).split())))
+            self._href = None
+            self._text = []
 
 
-# Cache the downloaded inventory pages once per dealer. Every watched bike then
-# reuses the same pages instead of hammering the dealer nine times.
-_INDEX_PAGE_CACHE: dict[str, list[str]] = {}
-_DETAIL_CACHE: dict[str, str] = {}
-
-
-def fetch(url: str) -> str:
-    req = Request(url, headers={
+def fetch(url: str, referer: str | None = None, retries: int = 1) -> str:
+    headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -80,11 +80,31 @@ def fetch(url: str) -> str:
         "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.7",
         "Accept-Encoding": "identity",
         "Cache-Control": "no-cache",
-    })
-    with urlopen(req, timeout=35, context=ssl.create_default_context()) as response:
-        raw = response.read()
-        charset = response.headers.get_content_charset() or "utf-8"
-        return raw.decode(charset, errors="replace")
+        "Connection": "close",
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            req = Request(url, headers=headers)
+            with _OPENER.open(req, timeout=35) as response:
+                raw = response.read()
+                charset = response.headers.get_content_charset() or "utf-8"
+                return raw.decode(charset, errors="replace")
+        except HTTPError as exc:
+            last_error = exc
+            if exc.code not in (403, 408, 429, 500, 502, 503, 504) or attempt >= retries:
+                raise
+            time.sleep(1.0 + attempt)
+        except URLError as exc:
+            last_error = exc
+            if attempt >= retries:
+                raise
+            time.sleep(1.0 + attempt)
+    assert last_error is not None
+    raise last_error
 
 
 def _norm(value: str) -> str:
@@ -112,239 +132,163 @@ def strict_model_match(text: str, bike: dict) -> bool:
         "triumph-daytona-675": lambda x: "daytona675" in x,
         "suzuki-gsxr600": lambda x: "gsxr600" in x,
         "aprilia-rs660": lambda x: "rs660" in x,
-        "honda-hornet-750": lambda x: ("cb750" in x and "hornet" in x) or "hornet750" in x,
+        "honda-hornet-750": lambda x: "hornet" in x and ("750" in x or "cb750" in x),
     }
     if bid in rules:
         return bool(rules[bid](t))
     model = _norm(str(bike.get("model", "")))
-    return model in t if model else relevant(text, bike)
+    return bool(model and model in t)
 
 
-_URL_ALIASES = {
-    "honda-cbr600f": ("cbr600f", "cbr600fa"),
-    "honda-cbr600rr": ("cbr600rr",),
-    "honda-cbr650r": ("cbr650r",),
-    "honda-cbr500r": ("cbr500r",),
-    "yamaha-r3": ("yzfr3",),
-    "yamaha-r6": ("yzfr6",),
-    "yamaha-r7": ("yzfr7",),
-    "honda-rebel500": ("cmx500", "rebel500"),
-    "triumph-street-triple-675": ("streettriple675",),
-    "triumph-daytona-675": ("daytona675",),
-    "suzuki-gsxr600": ("gsxr600",),
-    "aprilia-rs660": ("rs660",),
-    "honda-hornet-750": ("cb750hornet", "hornet750", "cb750"),
-}
+def _brand_slug(make: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (make or "").strip().lower()).strip("-")
 
 
-def _candidate_url(url: str, bike: dict) -> bool:
-    path = unquote(urlparse(url).path).replace("+", " ")
-    n = _norm(path)
-    aliases = _URL_ALIASES.get(str(bike.get("id", "")))
-    if aliases:
-        return any(alias in n for alias in aliases)
-    model = _norm(str(bike.get("model", "")))
-    return bool(model and model in n)
+def _index_url(bike: dict, page_no: int = 1) -> str:
+    brand = _brand_slug(str(bike.get("make", "")))
+    base = f"{GOEDHART.base}/motoren/{brand}-motoren?condition=10070"
+    return base if page_no <= 1 else base + f"&p={page_no}"
 
 
-def _index_url(dealer: Dealer, page_no: int) -> str:
-    if dealer.index_kind == "arie":
-        if page_no <= 1:
-            return dealer.base + "/occasions/"
-        return dealer.base + f"/occasions/?pagina={page_no}"
-    if dealer.index_kind == "goedhart":
-        if page_no <= 1:
-            return dealer.base + "/motoren?condition=10070"
-        return dealer.base + f"/motoren?condition=10070&p={page_no}"
-    raise ValueError(f"Unknown dealer index kind: {dealer.index_kind}")
+def _card_fragment(page: str, href: str) -> str:
+    # Inventory pages usually use relative hrefs while _extract_links normalizes
+    # them to absolute URLs. Try both forms when locating the surrounding card.
+    needles = [href]
+    parsed = urlparse(href)
+    if parsed.path:
+        rel = parsed.path + (("?" + parsed.query) if parsed.query else "")
+        needles += [rel, html_lib.escape(rel, quote=True)]
+    pos = -1
+    for needle in needles:
+        pos = page.find(needle)
+        if pos >= 0:
+            break
+    if pos < 0:
+        return ""
+    starts: list[tuple[int, str]] = []
+    for token in ("<li", "<article", '<div class="product-item-info', "<div class='product-item-info"):
+        p = page.rfind(token, max(0, pos - 15000), pos)
+        if p >= 0:
+            starts.append((p, token))
+    if starts:
+        start, token = max(starts)
+        if token.startswith("<li"):
+            close = "</li>"
+        elif token.startswith("<article"):
+            close = "</article>"
+        else:
+            close = "</div>"
+        end = page.find(close, pos, min(len(page), pos + 20000))
+        if end >= 0:
+            return page[start : end + len(close)]
+    return page[max(0, pos - 5000) : min(len(page), pos + 9000)]
 
 
-def _extract_hrefs(page: str, base: str) -> list[str]:
-    parser = HrefCollector()
+def _extract_links(page: str) -> list[tuple[str, str]]:
+    parser = LinkCollector()
     try:
         parser.feed(page)
     except Exception:
         pass
-
-    # Include hrefs embedded inside script/json too.
-    raw = list(parser.hrefs)
-    raw += re.findall(r'''href\s*=\s*["']([^"']+)["']''', page, flags=re.I)
-    raw += [m.replace("\\/", "/") for m in re.findall(r'''https?:\\/\\/[^"'<>\s]+''', page, flags=re.I)]
-
-    base_host = urlparse(base).netloc.lower()
-    out: list[str] = []
+    out: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for href in raw:
-        h = html_lib.unescape(str(href)).replace("\\/", "/").strip()
-        if not h or h.startswith(("javascript:", "mailto:", "tel:")):
+    host = urlparse(GOEDHART.base).netloc.lower()
+    for href, anchor in parser.links:
+        raw = html_lib.unescape(str(href)).replace("\\/", "/").strip()
+        if not raw or raw.startswith(("javascript:", "mailto:", "tel:")):
             continue
-        url = urljoin(base + "/", h).split("#", 1)[0]
+        url = urljoin(GOEDHART.base + "/", raw).split("#", 1)[0]
         parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != base_host:
+        if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != host:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append((url, anchor))
+    return out
+
+
+def _parse_price(text: str) -> int | None:
+    values: list[int] = []
+    for m in re.finditer(r"(?:€|eur)\s*([0-9]{1,3}(?:[.\s][0-9]{3})+|[0-9]{3,5})(?:[,.][0-9]{2}|,-)?", text, flags=re.I):
+        n = _num(m.group(1))
+        if n is not None and 500 <= n <= 100000:
+            values.append(n)
+    return min(values) if values else None
+
+
+def _product_candidates(page: str, bike: dict) -> list[tuple[str, int]]:
+    blocked = (
+        "/motoren/", "/blog", "/technische-tekeningen", "/winkel", "/contact",
+        "/werkplaats", "/verhuur", "/klantenservice", "/account", "/checkout",
+        "/catalogsearch", "/media/", "/static/",
+    )
+    out: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    limit = int(bike.get("max_price_eur") or 999999)
+
+    for url, anchor in _extract_links(page):
+        path = unquote(urlparse(url).path).lower()
+        if path in ("", "/") or any(path.startswith(x) for x in blocked):
+            continue
+        fragment = _card_fragment(page, url)
+        card_text = strip_tags(fragment)
+        combined = f"{anchor} {card_text}"
+        if not strict_model_match(combined, bike):
+            continue
+        price = _parse_price(card_text)
+        # On Goedhart's occasion category pages, a real motorcycle card contains a
+        # visible asking price. Requiring it filters navigation/parts links.
+        if price is None:
+            continue
+        # Do not open detail pages for bikes that are already outside BikeHunter's
+        # configured ceiling. This also avoids pointless requests and rate limits.
+        if price > limit or price < 500:
             continue
         if url not in seen:
             seen.add(url)
-            out.append(url)
+            out.append((url, price))
     return out
-
-
-def _dealer_detail_links(page: str, dealer: Dealer) -> list[str]:
-    links = _extract_hrefs(page, dealer.base)
-    out: list[str] = []
-    for url in links:
-        path = unquote(urlparse(url).path).lower()
-        if dealer.index_kind == "arie":
-            # Canonical, certificate-valid detail route used by the public Arie site.
-            if "/occasion/" not in path:
-                continue
-        else:
-            # Goedhart product pages live directly under the main host. Exclude known
-            # navigation/content routes; model matching below will remove the rest.
-            blocked = (
-                "/motoren", "/blog", "/technische-tekeningen", "/winkel", "/contact",
-                "/werkplaats", "/verhuur", "/klantenservice", "/account", "/checkout",
-                "/catalogsearch", "/media/", "/static/",
-            )
-            if any(path.startswith(x) for x in blocked):
-                continue
-            if path in ("", "/"):
-                continue
-        out.append(url)
-    return out
-
-
-def _crawl_inventory_pages(dealer: Dealer) -> list[str]:
-    cached = _INDEX_PAGE_CACHE.get(dealer.key)
-    if cached is not None:
-        return cached
-
-    pages: list[str] = []
-    previous_signature: tuple[str, ...] | None = None
-    successful = 0
-
-    for page_no in range(1, dealer.max_pages + 1):
-        url = _index_url(dealer, page_no)
-        try:
-            page = fetch(url)
-        except HTTPError as exc:
-            if page_no > 1 and getattr(exc, "code", None) in (404, 410):
-                break
-            raise
-
-        links = _dealer_detail_links(page, dealer)
-        signature = tuple(links[:30])
-        if page_no == 1 and not links:
-            raise ValueError(f"{dealer.name} inventory page returned no dealer listing links")
-        if not links:
-            break
-        if previous_signature is not None and signature == previous_signature:
-            break
-
-        pages.append(page)
-        successful += 1
-        previous_signature = signature
-
-        # If there is no obvious next-page reference, stop after the current page.
-        # This is intentionally permissive because both dealer sites currently expose
-        # explicit page parameters and repeated-page detection protects us from loops.
-        text = strip_tags(page).lower()
-        if dealer.index_kind == "arie":
-            next_markers = (f"pagina={page_no + 1}", "volgende")
-        else:
-            next_markers = (f"p={page_no + 1}", "pagina volgende", "next")
-        if page_no > 1 and not any(marker in page.lower() or marker in text for marker in next_markers):
-            # Keep one extra page worth of tolerance for themes that omit explicit text.
-            if len(links) < 10:
-                break
-
-    if successful == 0:
-        raise ValueError(f"{dealer.name} inventory could not be read")
-
-    _INDEX_PAGE_CACHE[dealer.key] = pages
-    print(f"  {dealer.source}: indexed {successful} inventory page(s) on canonical HTTPS host")
-    return pages
-
-
-def _detail_page(url: str) -> str:
-    if url not in _DETAIL_CACHE:
-        _DETAIL_CACHE[url] = fetch(url)
-    return _DETAIL_CACHE[url]
 
 
 def _field(text: str, label: str, pattern: str) -> str | None:
-    # Tolerate either "Label: value" or table-like "Label | value" text.
-    m = re.search(rf"\b{re.escape(label)}\s*:?[\s|\-]*({pattern})", text, flags=re.I)
+    m = re.search(rf"\b{re.escape(label)}\s*:?\s*({pattern})", text, flags=re.I)
     return m.group(1).strip() if m else None
 
 
 def _extract_title(page: str, text: str, bike: dict) -> str | None:
-    headings = []
-    for tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+    for tag in ("h1", "h2", "h3", "h4"):
         for m in re.finditer(rf"<{tag}\b[^>]*>(.*?)</{tag}>", page, flags=re.I | re.S):
             value = strip_tags(m.group(1)).strip()
-            if value:
-                headings.append(value)
-    for value in headings:
-        if strict_model_match(value, bike):
-            return value
-
+            if value and strict_model_match(value, bike):
+                return value
     make = _field(text, "Merk", r"[A-Za-z0-9À-ÿ .+/_-]{2,40}")
     model = _field(text, "Type", r"[A-Za-z0-9À-ÿ .+/_-]{2,80}")
     combined = " ".join(x for x in (make, model) if x).strip()
-    if combined and strict_model_match(combined, bike):
-        return combined
-    return None
+    return combined if combined and strict_model_match(combined, bike) else None
 
 
-def _parse_price(text: str, title: str | None = None) -> int | None:
-    # Dealer pages have large navigation menus. Restrict price extraction to a window
-    # around the actual bike title when possible, then fall back to the whole page.
-    windows: list[str] = []
-    if title:
-        pos = text.lower().find(title.lower())
-        if pos >= 0:
-            windows.append(text[max(0, pos - 1200):pos + 1800])
-    windows.append(text)
-
-    for window in windows:
-        values: list[int] = []
-        for m in re.finditer(r"(?:€|eur)\s*([0-9]{1,3}(?:[.\s][0-9]{3})+|[0-9]{3,5})(?:[,.][0-9]{2}|,-)?", window, flags=re.I):
-            n = _num(m.group(1))
-            if n is not None and 500 <= n <= 100000:
-                values.append(n)
-        if values:
-            # Sale pages sometimes show current + crossed-out old price; current is lower.
-            return min(values)
-    return None
-
-
-def _source_id(url: str, dealer: Dealer) -> str:
+def _source_id(url: str) -> str:
     path = unquote(urlparse(url).path).rstrip("/")
     tail = path.rsplit("/", 1)[-1]
-    if tail and re.fullmatch(r"[A-Za-z0-9_.-]{3,100}", tail):
-        return dealer.key + "-" + tail.lower()
-    return dealer.key + "-" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:18]
+    if tail and re.fullmatch(r"[A-Za-z0-9_.-]{3,140}", tail):
+        return "goedhart-" + tail.lower()
+    return "goedhart-" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:18]
 
 
-def parse_detail(page: str, url: str, bike: dict, dealer: Dealer) -> dict | None:
+def parse_detail(page: str, url: str, bike: dict, card_price: int | None = None) -> dict | None:
     text = strip_tags(page)
     title = _extract_title(page, text, bike)
     if not title:
         return None
-
-    price = _parse_price(text, title)
+    price = _parse_price(text) or card_price
 
     year = None
-    value = _field(text, "Bouwjaar", r"(?:19|20)\d{2}")
-    if not value:
-        value = _field(text, "Modeljaar", r"(?:19|20)\d{2}")
-    if not value:
-        # Arie inventory/detail pages also expose "Model: 2023".
-        value = _field(text, "Model", r"(?:19|20)\d{2}")
-    if value:
-        m = re.search(r"(?:19|20)\d{2}", value)
-        if m:
-            year = int(m.group(0))
+    for label in ("Bouwjaar", "Modeljaar"):
+        value = _field(text, label, r"(?:19|20)\d{2}")
+        if value:
+            year = int(re.search(r"(?:19|20)\d{2}", value).group(0))
+            break
 
     mileage = None
     value = _field(text, "Kilometerstand", r"[0-9][0-9.\s]{0,10}\s*(?:km)?")
@@ -354,15 +298,15 @@ def parse_detail(page: str, url: str, bike: dict, dealer: Dealer) -> dict | None
             mileage = None
 
     return {
-        "source_id": _source_id(url, dealer),
+        "source_id": _source_id(url),
         "bike_id": bike["id"],
         "title": title,
         "price": price,
         "year": year,
         "km": mileage,
-        "location": dealer.city,
-        "seller": dealer.name,
-        "source": dealer.source,
+        "location": GOEDHART.city,
+        "seller": GOEDHART.name,
+        "source": GOEDHART.source,
         "country": "NL",
         "url": url,
         "image_url": extract_first_image(page),
@@ -372,52 +316,35 @@ def parse_detail(page: str, url: str, bike: dict, dealer: Dealer) -> dict | None
     }
 
 
-def _search(dealer: Dealer, bike: dict) -> tuple[list[dict], str]:
-    pages = _crawl_inventory_pages(dealer)
+def search_goedhart(bike: dict) -> tuple[list[dict], str]:
+    index_url = _index_url(bike, 1)
+    if index_url not in _PAGE_CACHE:
+        _PAGE_CACHE[index_url] = fetch(index_url, retries=1)
+    page = _PAGE_CACHE[index_url]
 
-    # Collect matching detail URLs from the canonical inventory pages.
-    seen: set[str] = set()
-    candidates: list[str] = []
-    for page in pages:
-        for url in _dealer_detail_links(page, dealer):
-            if url in seen or not _candidate_url(url, bike):
-                continue
-            seen.add(url)
-            candidates.append(url)
-
+    candidates = _product_candidates(page, bike)
     listings: list[dict] = []
-    fetch_failures = 0
-    for url in candidates[:120]:
+    failed = 0
+    for url, card_price in candidates[:30]:
         try:
-            detail = _detail_page(url)
-            item = parse_detail(detail, url, bike, dealer)
-        except (HTTPError, URLError):
-            fetch_failures += 1
+            if url not in _DETAIL_CACHE:
+                time.sleep(0.35)
+                _DETAIL_CACHE[url] = fetch(url, referer=index_url, retries=1)
+            item = parse_detail(_DETAIL_CACHE[url], url, bike, card_price)
+        except (HTTPError, URLError) as exc:
+            failed += 1
+            code = getattr(exc, "code", "connection")
+            print(f"  {GOEDHART.source}: detail skipped ({code}) {url}")
             continue
         if item:
             listings.append(item)
 
-    if candidates and fetch_failures == len(candidates):
-        raise ValueError(f"{dealer.name} matching detail pages could not be fetched")
-
     unique = {x["source_id"]: x for x in listings}
-    print(f"  {dealer.source}: {len(candidates)} matching detail link(s) -> {len(unique)} parsed")
-    return list(unique.values()), _index_url(dealer, 1)
+    print(
+        f"  {GOEDHART.source}: {len(candidates)} affordable matching card(s) -> "
+        f"{len(unique)} parsed" + (f" ({failed} detail fetch failed)" if failed else "")
+    )
+    return list(unique.values()), index_url
 
 
-def search_arie_molenaar(bike: dict) -> tuple[list[dict], str]:
-    return _search(DEALERS["arie"], bike)
-
-
-def search_goedhart(bike: dict) -> tuple[list[dict], str]:
-    return _search(DEALERS["goedhart"], bike)
-
-
-__all__ = [
-    "HTTPError",
-    "URLError",
-    "search_arie_molenaar",
-    "search_goedhart",
-    "strict_model_match",
-    "parse_detail",
-]
+__all__ = ["HTTPError", "URLError", "search_goedhart", "strict_model_match", "parse_detail"]

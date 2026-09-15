@@ -17,7 +17,6 @@ from viabovag_nl import HTTPError as BovagHTTPError, URLError as BovagURLError, 
 from direct_dealers_nl import (
     HTTPError as DealerHTTPError,
     URLError as DealerURLError,
-    search_arie_molenaar,
     search_goedhart,
 )
 
@@ -319,6 +318,7 @@ def main() -> int:
         # Retired/unreliable sources: keep historical rows from lingering on the dashboard.
         sb_request("PATCH", "listings?source=eq.Motoroccasion%20NL", {"active": False}, "return=minimal")
         sb_request("PATCH", "listings?source=eq.BikeNet%20Dealers%20NL", {"active": False}, "return=minimal")
+        sb_request("PATCH", "listings?source=eq.Arie%20Molenaar%20Motors%20NL", {"active": False}, "return=minimal")
 
         existing_rows = sb_request("GET", "listings?select=source,external_id,price,bike_id,first_seen&limit=1000") or []
         existing = {(r["source"], str(r["external_id"])): r for r in existing_rows}
@@ -332,7 +332,6 @@ def main() -> int:
                 ("Marktplaats NL", search_marktplaats, MpHTTPError, MpURLError),
                 ("AutoScout24 NL", search_autoscout24_nl, AsNlHTTPError, AsNlURLError),
                 ("viaBOVAG NL", search_viabovag_nl, BovagHTTPError, BovagURLError),
-                ("Arie Molenaar Motors NL", search_arie_molenaar, DealerHTTPError, DealerURLError),
                 ("Goedhart Motoren NL", search_goedhart, DealerHTTPError, DealerURLError),
             ],
             "BE": [
