@@ -345,6 +345,108 @@ def _source_id(url: str) -> str:
     return "goedhart-" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:18]
 
 
+
+
+def _goedhart_product_image(page: str) -> str | None:
+    """Extract the actual Goedhart product photo, not Magento's loader GIF.
+
+    Goedhart lazy-loads the product gallery. The first ordinary <img src> in
+    the HTML can therefore be /static/.../loader-1.gif. Real bike images are
+    exposed later in gallery JSON, metadata or lazy-load attributes.
+    """
+    if not page:
+        return None
+
+    candidates: list[str] = []
+
+    # Product/social metadata when present.
+    for tag in re.findall(r"<meta\b[^>]*>", page, flags=re.I | re.S):
+        if not re.search(r"(?:property|name|itemprop)=[\"'](?:og:image|twitter:image|image)[\"']", tag, flags=re.I):
+            continue
+        m = re.search(r"content=[\"']([^\"']+)[\"']", tag, flags=re.I)
+        if m:
+            candidates.append(m.group(1))
+
+    # Magento gallery JSON usually contains keys such as img/full/thumb.
+    for m in re.finditer(
+        r"[\"'](?:img|full|thumb|image|large|medium)[\"']\s*:\s*[\"']([^\"']+)[\"']",
+        page,
+        flags=re.I,
+    ):
+        candidates.append(m.group(1))
+
+    # Lazy-loaded and normal image attributes.
+    for attr in ("data-src", "data-original", "data-lazy-src", "data-image", "src"):
+        pat = r"<img\b[^>]*\b" + re.escape(attr) + r"=[\"']([^\"']+)[\"']"
+        candidates.extend(m.group(1) for m in re.finditer(pat, page, flags=re.I | re.S))
+
+    # Responsive images. Keep every URL from srcset/data-srcset.
+    for attr in ("srcset", "data-srcset"):
+        pat = r"<img\b[^>]*\b" + re.escape(attr) + r"=[\"']([^\"']+)[\"']"
+        for m in re.finditer(pat, page, flags=re.I | re.S):
+            for part in m.group(1).split(","):
+                value = part.strip().split(" ", 1)[0]
+                if value:
+                    candidates.append(value)
+
+    # Last fallback: image-looking URLs embedded anywhere in Magento JSON/HTML.
+    for m in re.finditer(r"(?:https?:\?/?\?/|/)[^\"'<>\s]+?\.(?:jpe?g|png|webp)(?:\?[^\"'<>\s]*)?", page, flags=re.I):
+        candidates.append(m.group(0))
+
+    def normalize(raw: str) -> str | None:
+        value = html_lib.unescape(raw or "").strip()
+        value = value.replace("\\/", "/")
+        value = value.replace("\\u002F", "/").replace("\\u002f", "/")
+        if value.startswith("//"):
+            value = "https:" + value
+        elif value.startswith("/"):
+            value = urljoin(GOEDHART.base + "/", value)
+        if not value.startswith(("http://", "https://")):
+            return None
+        return value
+
+    best: tuple[int, str] | None = None
+    seen: set[str] = set()
+    for raw in candidates:
+        url = normalize(raw)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        low = url.lower()
+
+        # Explicitly reject the exact placeholder that ended up in Supabase,
+        # plus generic site chrome/assets that are never the motorcycle photo.
+        if any(x in low for x in (
+            "loader-1.gif", "placeholder", "no-image", "no_image",
+            "/static/", "logo", "sprite", "icon", "favicon",
+            "ideal", "paypal", "mastercard", "visa", "sofort",
+        )):
+            continue
+
+        score = 0
+        if "/media/catalog/product/" in low:
+            score += 200
+        elif "/media/" in low:
+            score += 80
+        if "catalog/product/cache" in low:
+            score += 80
+        if re.search(r"\.(?:jpe?g|webp)(?:[?#]|$)", low):
+            score += 35
+        elif re.search(r"\.png(?:[?#]|$)", low):
+            score += 15
+        if "goedhartmotoren.nl" in urlparse(url).netloc.lower():
+            score += 15
+        if "rhc" in low:
+            score += 25
+        if any(x in low for x in ("banner", "megastore", "footer", "payment", "brand")):
+            score -= 80
+
+        if score > 0 and (best is None or score > best[0]):
+            best = (score, url)
+
+    return best[1] if best else None
+
+
 def parse_detail(page: str, url: str, bike: dict, card_price: int | None = None) -> dict | None:
     text = strip_tags(page)
     title = _extract_title(page, text, bike)
@@ -393,7 +495,7 @@ def parse_detail(page: str, url: str, bike: dict, card_price: int | None = None)
         "source": GOEDHART.source,
         "country": "NL",
         "url": url,
-        "image_url": extract_first_image(page),
+        "image_url": _goedhart_product_image(page) or extract_first_image(page),
         "conditional_price": False,
         "features": detect_features(text),
         "raw_text": text[:1800],
