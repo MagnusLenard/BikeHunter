@@ -190,8 +190,13 @@ def _extract_links(page: str) -> list[tuple[str, str]]:
         parser.feed(page)
     except Exception:
         pass
-    out: list[tuple[str, str]] = []
-    seen: set[str] = set()
+
+    # Magento product cards commonly link the same product more than once:
+    # first an image-only <a> (empty anchor text), then the actual product-name
+    # <a>.  Older BikeHunter code kept the *first* URL and discarded the later
+    # title link, so every real Goedhart product could silently fail matching.
+    # Keep the best/non-empty anchor text seen for each URL instead.
+    by_url: dict[str, str] = {}
     host = urlparse(GOEDHART.base).netloc.lower()
     for href, anchor in parser.links:
         raw = html_lib.unescape(str(href)).replace("\\/", "/").strip()
@@ -201,17 +206,24 @@ def _extract_links(page: str) -> list[tuple[str, str]]:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != host:
             continue
-        if url in seen:
-            continue
-        seen.add(url)
-        out.append((url, anchor))
-    return out
+        clean_anchor = " ".join((anchor or "").split())
+        previous = by_url.get(url, "")
+        if url not in by_url or (clean_anchor and len(clean_anchor) > len(previous)):
+            by_url[url] = clean_anchor
+    return list(by_url.items())
 
 
 def _parse_price(text: str) -> int | None:
     values: list[int] = []
     for m in re.finditer(r"(?:€|eur)\s*([0-9]{1,3}(?:[.\s][0-9]{3})+|[0-9]{3,5})(?:[,.][0-9]{2}|,-)?", text, flags=re.I):
-        n = _num(m.group(1))
+        # Dutch prices are usually rendered as € 9.690,00.  Treat dots/spaces
+        # as thousands separators and ignore the cents instead of turning that
+        # into 969000.
+        raw = m.group(0)
+        amount = re.sub(r"^(?:€|eur)\s*", "", raw, flags=re.I).strip()
+        amount = re.sub(r"(?:,[0-9]{2}|,-)$", "", amount)
+        amount = amount.replace(".", "").replace(" ", "")
+        n = int(amount) if amount.isdigit() else None
         if n is not None and 500 <= n <= 100000:
             values.append(n)
     return min(values) if values else None
@@ -233,11 +245,13 @@ def _product_candidates(page: str, bike: dict) -> list[tuple[str, int | None]]:
         path = unquote(urlparse(url).path).lower().rstrip("/")
         if path in ("", "/") or any(path.startswith(x) for x in blocked):
             continue
-        if not strict_model_match(anchor, bike):
-            continue
 
         fragment = _card_fragment(page, url)
         card_text = strip_tags(fragment)
+        # Match against both the best anchor and its surrounding card.  This
+        # survives image-only links and minor Magento template changes.
+        if not strict_model_match(f"{anchor} {card_text}", bike):
+            continue
         tail = path.rsplit("/", 1)[-1]
         stock_like = bool(re.search(r"(?:^|-)rhc[0-9a-z-]+$", tail, flags=re.I))
         occasion_like = "occasion" in card_text.lower()
