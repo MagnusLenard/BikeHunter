@@ -14,7 +14,6 @@ from tweedehands import HTTPError as BeHTTPError, URLError as BeURLError, search
 from autoscout24_de import HTTPError as DeHTTPError, URLError as DeURLError, search_bike as search_autoscout24_de
 from autoscout24_nl import HTTPError as AsNlHTTPError, URLError as AsNlURLError, search_bike as search_autoscout24_nl
 from viabovag_nl import HTTPError as BovagHTTPError, URLError as BovagURLError, search_bike as search_viabovag_nl
-from bikenet_nl import HTTPError as BikeNetHTTPError, URLError as BikeNetURLError, search_bike as search_bikenet_nl
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
@@ -311,9 +310,9 @@ def main() -> int:
                     previous_counts = {}
             if isinstance(previous_counts, dict):
                 previous_source_labels = set(previous_counts.keys())
-        # Motoroccasion blocks the GitHub cloud runner. It is retired in favor of BikeNet
-        # dealer coverage; deactivate any historical Motoroccasion rows so they do not linger.
+        # Retired/unreliable sources: keep historical rows from lingering on the dashboard.
         sb_request("PATCH", "listings?source=eq.Motoroccasion%20NL", {"active": False}, "return=minimal")
+        sb_request("PATCH", "listings?source=eq.BikeNet%20Dealers%20NL", {"active": False}, "return=minimal")
 
         existing_rows = sb_request("GET", "listings?select=source,external_id,price,bike_id,first_seen&limit=1000") or []
         existing = {(r["source"], str(r["external_id"])): r for r in existing_rows}
@@ -326,7 +325,6 @@ def main() -> int:
             "NL": [
                 ("Marktplaats NL", search_marktplaats, MpHTTPError, MpURLError),
                 ("AutoScout24 NL", search_autoscout24_nl, AsNlHTTPError, AsNlURLError),
-                ("BikeNet Dealers NL", search_bikenet_nl, BikeNetHTTPError, BikeNetURLError),
                 ("viaBOVAG NL", search_viabovag_nl, BovagHTTPError, BovagURLError),
             ],
             "BE": [
@@ -342,7 +340,6 @@ def main() -> int:
         source_attempts = {v[0]: 0 for v in all_adapters}
         source_errors_count = {v[0]: 0 for v in all_adapters}
         source_blocked_403: set[str] = set()
-        source_blocked_404: set[str] = set()
         warnings: list[str] = []
         current: list[dict] = []
         bikes_by_slug = {b["id"]: b for b in bikes}
@@ -354,7 +351,7 @@ def main() -> int:
                 if not countries.get(code, True) or code not in adapters:
                     continue
                 for label, func, http_err, url_err in adapters[code]:
-                    if label in source_blocked_403 or label in source_blocked_404:
+                    if label in source_blocked_403:
                         continue
                     source_attempts[label] += 1
                     try:
@@ -365,9 +362,6 @@ def main() -> int:
                         if code_value == 403:
                             source_blocked_403.add(label)
                             msg = f"{label}: HTTP 403 (source rejected this cloud runner; remaining bikes skipped for this scan)"
-                        elif code_value == 404 and label == "BikeNet Dealers NL":
-                            source_blocked_404.add(label)
-                            msg = f"{label}: HTTP 404 across all BikeNet route variants (remaining bikes skipped for this scan)"
                         else:
                             msg = f"{bike['make']} {bike['model']} / {label}: HTTP {code_value}"
                         warnings.append(msg); print("  WARN", msg); continue
