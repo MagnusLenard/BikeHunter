@@ -1,0 +1,579 @@
+# PS5ProHunter v2.1 - Sony Direct NL/BE/DE (new + certified refurbished) + Marktplaats (sealed only) -> Telegram
+# Free: keep this repo PUBLIC (unlimited Actions minutes). Secrets stay private.
+# Needs repo secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# Optional repo variables: MAX_PRICE_EUR (default 1100), MP_QUERY (default "ps5 pro")
+name: PS5ProHunter
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to run"
+        required: true
+        default: both
+        type: choice
+        options: [both, sony, marktplaats, status, test_telegram]
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ps5pro-hunter
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      PS5_SCAN_MODE: ${{ inputs.mode || 'both' }}
+      MAX_PRICE_EUR: ${{ vars.MAX_PRICE_EUR || '1100' }}
+      MP_QUERY: ${{ vars.MP_QUERY || 'ps5 pro' }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT }}
+    steps:
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: ps5-state-${{ github.run_id }}
+          restore-keys: ps5-state-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install parser
+        run: python -m pip install --quiet --disable-pip-version-check beautifulsoup4
+
+      - name: Check Sony + Marktplaats
+        run: |
+          cat > hunter.py <<'PY'
+          """PS5 Pro Hunter v2 - Sony Direct (NL/BE/DE) + Marktplaats -> Telegram.
+
+          State lives in state.json (persisted between runs with actions/cache), so no
+          database is needed. Respects robots.txt and backs off when a site blocks us.
+          """
+          from __future__ import annotations
+
+          import datetime as dt
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote, urlsplit
+          from urllib.request import Request, urlopen
+          from urllib.robotparser import RobotFileParser
+          from zoneinfo import ZoneInfo
+
+          from bs4 import BeautifulSoup
+
+          # ---------------------------------------------------------------- settings
+          BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+          CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+          MODE = (os.getenv('PS5_SCAN_MODE') or 'both').lower()
+          MAX_PRICE = int(os.getenv('MAX_PRICE_EUR') or '1100')
+          MP_QUERY = os.getenv('MP_QUERY') or 'ps5 pro'
+          HEARTBEAT_HOUR = int(os.getenv('HEARTBEAT_HOUR') or '9')       # Amsterdam time
+          STATE_FILE = os.getenv('STATE_FILE') or 'state.json'
+          DRY_RUN = os.getenv('PS5_DRY_RUN', 'false').lower() == 'true'
+          TZ = ZoneInfo('Europe/Amsterdam')
+          USER_AGENT = ('Mozilla/5.0 (compatible; PS5ProHunter/2.0; personal stock alert, '
+                        'one request per page every 5 min)')
+
+          SONY = {
+              'NL': os.getenv('SONY_URL_NL') or 'https://direct.playstation.com/nl-nl/buy-consoles/playstation5-pro-console-2-tb',
+              'BE': os.getenv('SONY_URL_BE') or 'https://direct.playstation.com/nl-be/buy-consoles/playstation5-pro-console-2-tb',
+              'DE': os.getenv('SONY_URL_DE') or 'https://direct.playstation.com/de-de/buy-consoles/playstation5-pro-console-2-tb',
+          }
+          SONY_REFURB = {
+              'NL': os.getenv('SONY_REFURB_URL_NL') or 'https://direct.playstation.com/nl-nl/certified-refurbished',
+              'BE': os.getenv('SONY_REFURB_URL_BE') or 'https://direct.playstation.com/nl-be/certified-refurbished',
+              'DE': os.getenv('SONY_REFURB_URL_DE') or 'https://direct.playstation.com/de-de/certified-refurbished',
+          }
+          LANG = {'NL': 'nl-NL,nl;q=0.9', 'BE': 'nl-BE,nl;q=0.9', 'DE': 'de-DE,de;q=0.9'}
+
+          PRO = re.compile(r'(?i)\b(?:ps\s*5|playstation\s*5)\s*pro\b')
+          OUT = re.compile(r'(?i)(uitverkocht|niet\s+(?:op\s+voorraad|beschikbaar)|nicht\s+vorr[aä]tig|'
+                           r'ausverkauft|nicht\s+verf[uü]gbar|derzeit\s+nicht|sold\s+out|out\s+of\s+stock)')
+          IN = re.compile(r'(?i)(in\s+(?:je\s+)?winkelwagen|toevoegen\s+aan\s+winkelwagen|in\s+den\s+warenkorb|'
+                          r'add\s+to\s+(?:cart|basket)|nu\s+kopen|jetzt\s+kaufen|op\s+voorraad|auf\s+lager)')
+          SEALED = re.compile(r'(?i)(\bsealed\b|\bgeseald\b|\bverzegeld\b|\bongeopend\b|nooit\s+geopend|'
+                              r'nieuw\s+in\s+(?:de\s+)?(?:doos|verpakking|seal)|in\s+seal\b|met\s+seal\b|'
+                              r'originele?\s+seal|seal\s+(?:nog\s+)?(?:intact|erop|er\s+nog\s+op)|'
+                              r'ungeöffnet|originalverpackt|\bovp\b|factory\s+sealed|brand\s+new\s+sealed)')
+          NOT_SEALED = re.compile(r'(?i)(niet\s+(?:meer\s+)?(?:sealed|geseald|verzegeld)|seal\s+(?:is\s+)?(?:verbroken|eraf|kapot|weg)|'
+                                  r'\bgeopend\b|\bgebruikt\b|tweedehands|2e\s*hands|zo\s+goed\s+als\s+nieuw|'
+                                  r'paar\s+keer\s+gebruikt|weinig\s+gebruikt|z\.?g\.?a\.?n\.?)')
+          SEAL_BROKEN = re.compile(r'(?i)(niet\s+(?:meer\s+)?(?:sealed|geseald|verzegeld)|seal\s+(?:is\s+)?(?:verbroken|eraf|kapot|weg)|'
+                                   r'(?:alleen|enkel)\s+(?:geopend|uitgepakt)|uitgepakt\s+(?:en|om))')
+          MAX_MP_DETAIL_FETCHES = 6
+          MP_EXCLUDE = re.compile(r'(?i)\b(gezocht|gevraagd|zoek|ruil|controller|dualsense|hoes|hoesje|cover|'
+                                  r'skin|sticker|standaard|stand|houder|disc\s*drive|discdrive|schijfstation|'
+                                  r'lege\s+doos|alleen\s+doos|doos\s+only|box\s+only|portal|slim|ps4|'
+                                  r'kapot|defect|onderdelen|oplader|headset|koeler|fan|game\b|spel\b)\b')
+
+
+          def now() -> dt.datetime:
+              return dt.datetime.now(dt.timezone.utc)
+
+
+          # ---------------------------------------------------------------- state
+          def load_state() -> dict:
+              try:
+                  with open(STATE_FILE, encoding='utf-8') as f:
+                      s = json.load(f)
+                      return s if isinstance(s, dict) else {}
+              except (OSError, ValueError):
+                  return {}
+
+
+          def save_state(state: dict) -> None:
+              with open(STATE_FILE, 'w', encoding='utf-8') as f:
+                  json.dump(state, f, ensure_ascii=False, indent=1)
+
+
+          # ---------------------------------------------------------------- http
+          def fetch(url: str, accept: str = 'text/html,application/xhtml+xml,*/*;q=0.8',
+                    lang: str = 'nl-NL,nl;q=0.9', timeout: int = 15):
+              """Returns (status, final_url, text). Never raises for HTTP errors."""
+              req = Request(url, headers={'User-Agent': USER_AGENT, 'Accept': accept,
+                                          'Accept-Language': lang})
+              try:
+                  with urlopen(req, timeout=timeout) as r:
+                      return r.status, r.geturl(), r.read(3_000_000).decode('utf-8', 'replace')
+              except HTTPError as e:
+                  try:
+                      body = e.read(20000).decode('utf-8', 'replace')
+                  except Exception:
+                      body = ''
+                  return e.code, getattr(e, 'url', url) or url, body
+              except (URLError, TimeoutError, OSError) as e:
+                  return 0, url, f'{type(e).__name__}: {e}'
+
+
+          _robots: dict[str, RobotFileParser | None] = {}
+
+
+          def robots_ok(url: str) -> bool:
+              host = urlsplit(url).netloc
+              if host not in _robots:
+                  code, _, txt = fetch(f'https://{host}/robots.txt', accept='text/plain')
+                  rp = RobotFileParser()
+                  if code == 200:
+                      rp.parse(txt.splitlines())
+                  elif code in (404, 410):
+                      rp.parse([])                     # no robots.txt = allowed
+                  else:
+                      rp = None                        # can't read it: be conservative
+                  _robots[host] = rp
+              rp = _robots[host]
+              return bool(rp and rp.can_fetch(USER_AGENT, url))
+
+
+          # ---------------------------------------------------------------- telegram
+          def tg(text: str) -> bool:
+              if DRY_RUN or not (BOT_TOKEN and CHAT_ID):
+                  print('[telegram]' + (' (dry run)' if DRY_RUN else ' (no credentials)') + '\n' + text)
+                  return DRY_RUN
+              data = json.dumps({'chat_id': CHAT_ID, 'text': text,
+                                 'disable_web_page_preview': False}).encode()
+              req = Request(f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage', data=data,
+                            headers={'Content-Type': 'application/json'}, method='POST')
+              for attempt in range(3):
+                  try:
+                      with urlopen(req, timeout=15) as r:
+                          if json.loads(r.read()).get('ok'):
+                              return True
+                  except Exception as e:
+                      print('Telegram error:', type(e).__name__, e)
+                  time.sleep(2 * (attempt + 1))
+              return False
+
+
+          # ---------------------------------------------------------------- health
+          def record_health(state: dict, source: str, ok: bool, note: str) -> None:
+              h = state.setdefault('health', {}).setdefault(source, {'fails': 0})
+              h['last'] = note
+              h['checked'] = now().isoformat()
+              h['fails'] = 0 if ok else h.get('fails', 0) + 1
+              if ok:
+                  h['last_ok'] = now().isoformat()
+              # Warn once per day if a source has failed for ~1 hour straight.
+              today = now().astimezone(TZ).date().isoformat()
+              if h['fails'] >= 12 and h.get('warned') != today:
+                  tg(f'⚠️ PS5ProHunter: {source} has failed {h["fails"]} checks in a row.\n'
+                     f'Last result: {note}\nThe bot keeps trying; this warning repeats at most once a day.')
+                  h['warned'] = today
+
+
+          def in_backoff(state: dict, source: str) -> bool:
+              until = state.get('health', {}).get(source, {}).get('backoff_until')
+              if until and dt.datetime.fromisoformat(until) > now():
+                  print(f'{source}: backing off until {until}')
+                  return True
+              return False
+
+
+          def set_backoff(state: dict, source: str, minutes: int) -> None:
+              h = state.setdefault('health', {}).setdefault(source, {'fails': 0})
+              h['backoff_until'] = (now() + dt.timedelta(minutes=minutes)).isoformat()
+
+
+          # ---------------------------------------------------------------- sony
+          def ld_availability(soup: BeautifulSoup) -> tuple[str, int | None]:
+              def walk(node):
+                  if isinstance(node, list):
+                      for n in node:
+                          r = walk(n)
+                          if r:
+                              return r
+                  elif isinstance(node, dict):
+                      t = node.get('@type')
+                      types = t if isinstance(t, list) else [t]
+                      if 'Product' in types and PRO.search(str(node.get('name', ''))):
+                          offers = node.get('offers') or {}
+                          if isinstance(offers, list):
+                              offers = offers[0] if offers else {}
+                          return offers if isinstance(offers, dict) else None
+                      for k in ('@graph', 'mainEntity', 'itemListElement'):
+                          if k in node:
+                              r = walk(node[k])
+                              if r:
+                                  return r
+                  return None
+
+              for s in soup.find_all('script', type='application/ld+json'):
+                  try:
+                      offers = walk(json.loads(s.string or s.get_text() or 'null'))
+                  except (ValueError, TypeError):
+                      continue
+                  if offers:
+                      av = str(offers.get('availability', '')).lower()
+                      price = None
+                      try:
+                          price = int(round(float(str(offers.get('price')).replace(',', '.'))))
+                      except (TypeError, ValueError):
+                          pass
+                      if 'outofstock' in av or 'soldout' in av or 'discontinued' in av:
+                          return 'out', price
+                      if 'instock' in av or 'limitedavailability' in av or 'preorder' in av:
+                          return 'in', price
+              return 'unknown', None
+
+
+          def sony_status(html: str, final_url: str) -> tuple[str, int | None, str]:
+              host = urlsplit(final_url).netloc.lower()
+              if 'queue' in host or 'queue-it' in html[:200000].lower():
+                  return 'queue', None, 'Queue page active (drop in progress)'
+              soup = BeautifulSoup(html, 'html.parser')
+              status, price = ld_availability(soup)
+              if status != 'unknown':
+                  return status, price, 'structured data'
+              h1 = next((h for h in soup.find_all(['h1', 'h2']) if PRO.search(h.get_text(' ', strip=True))), None)
+              if not h1:
+                  return 'unknown', None, 'PS5 Pro product heading not found (page layout/URL changed?)'
+              region = h1.find_parent('main') or h1.find_parent('section') or soup
+              text = region.get_text(' ', strip=True)
+              i = text.lower().find(h1.get_text(' ', strip=True).lower())
+              focus = text[max(0, i): max(0, i) + 3000]
+              if OUT.search(focus):
+                  return 'out', None, 'page text'
+              if IN.search(focus):
+                  return 'in', None, 'page text'
+              return 'unknown', None, 'no stock wording found'
+
+
+          def check_sony(state: dict) -> None:
+              for cc, url in SONY.items():
+                  check_sony_page(state, f'Sony {cc}', f'new:{cc}', cc, url, 'PlayStation Direct')
+
+
+          def check_sony_refurb(state: dict) -> None:
+              for cc, catalog in SONY_REFURB.items():
+                  src = f'Sony refurb {cc}'
+                  if in_backoff(state, src):
+                      continue
+                  if not robots_ok(catalog):
+                      record_health(state, src, False, 'robots.txt disallows or unreadable - skipped')
+                      continue
+                  code, final, html = fetch(catalog, lang=LANG[cc])
+                  if code in (403, 429, 503):
+                      set_backoff(state, src, 30)
+                      record_health(state, src, False, f'HTTP {code} (blocked / rate-limited)')
+                      continue
+                  if code != 200:
+                      record_health(state, src, False, f'HTTP {code} - refurb page URL may have changed (SONY_REFURB_URL_{cc})')
+                      continue
+                  if 'queue' in urlsplit(final).netloc.lower():
+                      record_health(state, src, True, 'queue page active')
+                      continue
+                  soup = BeautifulSoup(html, 'html.parser')
+                  link = None
+                  for a in soup.select('a[href]'):
+                      text = a.get_text(' ', strip=True) + ' ' + (a.get('aria-label') or '')
+                      href = a['href']
+                      is_pro = PRO.search(text) or re.search(r'(?i)ps5[-_]?pro|playstation5[-_]pro', href)
+                      is_refurb = re.search(r'(?i)refurb|generalue?berholt|generalüberholt|gereviseerd|certified', href + ' ' + text)
+                      if is_pro and is_refurb and href.rstrip('/') != catalog.rstrip('/'):
+                          link = href if href.startswith('http') else 'https://direct.playstation.com/' + href.lstrip('/')
+                          break
+                  sstate = state.setdefault('sony', {})
+                  if not link:
+                      sstate[f'refurb:{cc}'] = 'out'
+                      record_health(state, src, True, 'no refurbished PS5 Pro listed')
+                      continue
+                  record_health(state, src, True, 'refurbished PS5 Pro listed - checking stock')
+                  check_sony_page(state, src, f'refurb:{cc}', cc, link, 'PlayStation Direct REFURBISHED')
+
+
+          def check_sony_page(state: dict, src: str, key: str, cc: str, url: str, label: str) -> None:
+              if in_backoff(state, src):
+                  return
+              if not robots_ok(url):
+                  record_health(state, src, False, 'robots.txt disallows or unreadable - skipped')
+                  return
+              code, final, html = fetch(url, lang=LANG[cc])
+              if code in (403, 429, 503):
+                  fails = state.get('health', {}).get(src, {}).get('fails', 0)
+                  set_backoff(state, src, min(60, 10 * (fails + 1)))
+                  record_health(state, src, False, f'HTTP {code} (blocked / rate-limited)')
+                  return
+              if code == 404:
+                  record_health(state, src, False, 'HTTP 404 - product URL changed, update SONY_URL_' + cc)
+                  return
+              if code != 200:
+                  record_health(state, src, False, f'HTTP {code} {html[:80] if code == 0 else ""}')
+                  return
+              status, price, how = sony_status(html, final)
+              print(f'{src}: {status} ({how}) price={price}')
+              record_health(state, src, status != 'unknown', f'{status} - {how}')
+              if status == 'unknown':
+                  return
+              sstate = state.setdefault('sony', {})
+              prev = sstate.get(key)
+              sstate[key] = status
+              if status in ('in', 'queue') and prev not in ('in', 'queue'):
+                  if price is not None and price > MAX_PRICE:
+                      print(f'{src}: in stock but €{price} > max €{MAX_PRICE}')
+                      return
+                  head = '🚨 PS5 PRO IN STOCK' if status == 'in' else '🚨 PS5 PRO QUEUE IS LIVE'
+                  tg(f'{head} - {label} {cc}\n'
+                     + (f'Price: €{price}\n' if price else '')
+                     + f'{url}\nGo now - drops sell out in minutes.')
+
+
+          # ---------------------------------------------------------------- marktplaats
+          def mp_listings_from_json(obj) -> list[dict]:
+              found: list[dict] = []
+
+              def walk(n):
+                  if isinstance(n, dict):
+                      if 'itemId' in n and 'title' in n:
+                          found.append(n)
+                          return
+                      for v in n.values():
+                          walk(v)
+                  elif isinstance(n, list):
+                      for v in n:
+                          walk(v)
+              walk(obj)
+              return found
+
+
+          def mp_fetch() -> tuple[list[dict], str]:
+              q = quote(MP_QUERY)
+              api = (f'https://www.marktplaats.nl/lrp/api/search?query={q}&limit=50&offset=0'
+                     f'&sortBy=SORT_INDEX&sortOrder=DECREASING')
+              page = f'https://www.marktplaats.nl/q/{quote(MP_QUERY.replace(" ", "+"), safe="+")}/#sortBy:SORT_INDEX|sortOrder:DECREASING'
+              notes = []
+              for url, kind in ((api, 'api'), (page, 'html')):
+                  if not robots_ok(url):
+                      notes.append(f'{kind}: robots.txt disallows')
+                      continue
+                  code, _, body = fetch(url, accept='application/json' if kind == 'api' else
+                                        'text/html,application/xhtml+xml,*/*;q=0.8')
+                  if code != 200:
+                      notes.append(f'{kind}: HTTP {code}')
+                      continue
+                  items: list[dict] = []
+                  if kind == 'api':
+                      try:
+                          items = mp_listings_from_json(json.loads(body))
+                      except ValueError:
+                          notes.append('api: not JSON')
+                  else:
+                      soup = BeautifulSoup(body, 'html.parser')
+                      for s in soup.find_all('script'):
+                          txt = s.string or ''
+                          if '"itemId"' not in txt:
+                              continue
+                          start = txt.find('{')
+                          try:
+                              items += mp_listings_from_json(json.loads(txt[start:].rstrip().rstrip(';')))
+                          except ValueError:
+                              continue
+                  if items:
+                      return items, f'{kind} ok'
+                  notes.append(f'{kind}: 0 listings parsed')
+              return [], '; '.join(notes)
+
+
+          def mp_price(item: dict) -> int | None:
+              p = item.get('priceInfo') or {}
+              cents = p.get('priceCents')
+              if isinstance(cents, (int, float)) and cents > 0:
+                  return int(round(cents / 100))
+              return None
+
+
+          def mp_condition(item: dict) -> str:
+              for a in item.get('attributes') or []:
+                  if isinstance(a, dict) and str(a.get('key', '')).lower() == 'condition':
+                      return str(a.get('value') or '')
+              return ''
+
+
+          def mp_sealed(item: dict, title: str, desc: str, link: str, budget: list) -> tuple[bool | None, str]:
+              """True only if the ad explicitly says sealed/unopened. None = couldn't check."""
+              cond = mp_condition(item)
+              if cond and cond.lower() not in ('nieuw', 'new'):
+                  return False, f'condition {cond}'
+              snippet = f'{title} {desc}'
+              if NOT_SEALED.search(snippet):
+                  return False, 'says opened/used'
+              if SEALED.search(snippet):
+                  return True, 'sealed (title/description)'
+              # Snippet is short - read the full ad, but only a few per run.
+              if budget[0] <= 0 or not link.startswith('https://www.marktplaats.nl/'):
+                  return None, 'detail budget used'
+              if not robots_ok(link):
+                  return False, 'ad page not allowed by robots.txt'
+              budget[0] -= 1
+              code, _, html = fetch(link)
+              if code != 200:
+                  return None, f'ad HTTP {code}'
+              soup = BeautifulSoup(html, 'html.parser')
+              for t in soup(['script', 'style', 'nav', 'footer', 'header']):
+                  t.decompose()
+              text = soup.get_text(' ', strip=True)[:15000]
+              # Whole page also contains filters/other ads, so only trust explicit seal-broken wording here.
+              if SEAL_BROKEN.search(text):
+                  return False, 'full ad says seal broken / opened'
+              if SEALED.search(text):
+                  return True, 'sealed (full ad text)'
+              return False, 'no sealed wording'
+
+
+          def check_marktplaats(state: dict) -> None:
+              src = 'Marktplaats'
+              if in_backoff(state, src):
+                  return
+              items, how = mp_fetch()
+              if not items:
+                  if 'HTTP 403' in how or 'HTTP 429' in how:
+                      set_backoff(state, src, 30)
+                  record_health(state, src, False, how)
+                  return
+              record_health(state, src, True, f'{len(items)} listings ({how})')
+              mp = state.setdefault('marktplaats', {})
+              seen: dict = mp.setdefault('seen', {})
+              first_run = not mp.get('initialized')
+              new_hits = 0
+              budget = [MAX_MP_DETAIL_FETCHES]
+              for it in items:
+                  iid = str(it.get('itemId'))
+                  title = str(it.get('title') or '')
+                  desc = str(it.get('description') or it.get('categorySpecificDescription') or '')
+                  if iid in seen:
+                      continue
+                  seen[iid] = now().isoformat()
+                  if not PRO.search(title) or MP_EXCLUDE.search(title):
+                      continue
+                  if (it.get('priorityProduct') or '').upper() in ('TOP_AD',) and first_run:
+                      continue
+                  price = mp_price(it)
+                  ptype = str((it.get('priceInfo') or {}).get('priceType') or '')
+                  if price is not None and price > MAX_PRICE:
+                      continue
+                  if price is not None and price < 250:          # bait / scam / accessory pricing
+                      continue
+                  if first_run:
+                      continue                                   # baseline: don't spam old ads
+                  vip = it.get('vipUrl') or ''
+                  link = vip if vip.startswith('http') else 'https://www.marktplaats.nl' + vip
+                  sealed_ok, why = mp_sealed(it, title, desc, link, budget)
+                  if sealed_ok is None:                          # couldn't read the ad: retry next run
+                      seen.pop(iid, None)
+                      continue
+                  if not sealed_ok:
+                      print(f'skip {iid} ({why}): {title[:60]}')
+                      continue
+                  loc = it.get('location') or {}
+                  city = loc.get('cityName') or ''
+                  dist = loc.get('distanceMeters')
+                  seller = (it.get('sellerInformation') or {}).get('sellerName') or ''
+                  price_txt = f'€{price}' if price is not None else {'BIEDEN': 'Bieden', 'NOTK': 'Notk',
+                                                                     'FAST_BID': 'Bieden'}.get(ptype, 'prijs n.v.t.')
+                  tg(f'🎮 SEALED PS5 PRO op Marktplaats - {price_txt}\n{title[:120]}\n✅ {why}\n'
+                     + (f'📍 {city}' + (f' ({round(dist / 1000)} km)' if isinstance(dist, (int, float)) and dist > 0 else '') + '\n' if city else '')
+                     + (f'👤 {seller}\n' if seller else '')
+                     + (f'{desc[:160]}\n' if desc else '')
+                     + f'{link}\n⚠️ Check seller & never pay upfront without protection.')
+                  new_hits += 1
+              mp['initialized'] = True
+              # keep the seen-list small: forget ids older than 30 days
+              cutoff = (now() - dt.timedelta(days=30)).isoformat()
+              mp['seen'] = {k: v for k, v in seen.items() if v >= cutoff}
+              print(f'{src}: {len(items)} listings, {new_hits} new alerts' + (' (baseline run)' if first_run else ''))
+
+
+          # ---------------------------------------------------------------- heartbeat
+          def heartbeat(state: dict, force: bool = False) -> None:
+              local = now().astimezone(TZ)
+              today = local.date().isoformat()
+              if not force and (local.hour < HEARTBEAT_HOUR or state.get('heartbeat') == today):
+                  return
+              lines = [f'✅ PS5ProHunter daily check-in ({local:%a %d %b %H:%M})',
+                       f'Max price: €{MAX_PRICE} · Marktplaats query: "{MP_QUERY}"']
+              for src, h in sorted(state.get('health', {}).items()):
+                  icon = '🟢' if h.get('fails', 0) == 0 else ('🟡' if h.get('fails', 0) < 12 else '🔴')
+                  lines.append(f'{icon} {src}: {h.get("last", "?")}')
+              tg('\n'.join(lines))
+              state['heartbeat'] = today
+
+
+          # ---------------------------------------------------------------- main
+          def main() -> None:
+              if MODE == 'test_telegram':
+                  ok = tg('PS5ProHunter v2 TEST: Telegram notifications are connected ✅')
+                  sys.exit(0 if ok else 1)
+              if MODE not in ('both', 'sony', 'marktplaats', 'status'):
+                  sys.exit(f'Unknown mode {MODE}')
+              state = load_state()
+              try:
+                  if MODE in ('both', 'sony'):
+                      check_sony(state)
+                      check_sony_refurb(state)
+                  if MODE in ('both', 'marktplaats'):
+                      check_marktplaats(state)
+                  heartbeat(state, force=(MODE == 'status'))
+              finally:
+                  save_state(state)
+
+
+          if __name__ == '__main__':
+              main()
+          PY
+          python hunter.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: ps5-state-${{ github.run_id }}-${{ github.run_attempt }}
