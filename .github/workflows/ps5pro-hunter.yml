@@ -1,0 +1,471 @@
+# PS5ProHunter - independent of BikeHunter's existing workflows
+# Sony is disabled until its automated-monitoring permissions are confirmed.
+# GitHub schedule minimum: 5 min. 5-minute jobs can exceed private-repo free minutes.
+name: PS5ProHunter
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Which source should run? Sony requires authorization variable"
+        required: true
+        default: marktplaats
+        type: choice
+        options:
+          - marktplaats
+          - sony
+          - both
+  schedule:
+    - cron: '2/5 * * * *'   # Fast Sony lane, guarded by permission flag
+    - cron: '23 * * * *'    # Marktplaats hourly
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ps5pro-hunter
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.schedule == '23 * * * *' ||
+      (github.event.schedule == '2/5 * * * *' && vars.SONY_MONITORING_AUTHORIZED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    env:
+      PS5_SCAN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || (github.event.schedule == '23 * * * *' && 'marktplaats' || 'sony') }}
+      SONY_MONITORING_AUTHORIZED: ${{ vars.SONY_MONITORING_AUTHORIZED || 'false' }}
+      MAX_PRICE_EUR: '1100'
+      SUPABASE_URL: https://clzdyxuyffaehmeugmyn.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY || secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install parser
+        run: python -m pip install --disable-pip-version-check beautifulsoup4==4.14.3 soupsieve==2.8
+      - name: Run price and stock monitor
+        shell: bash
+        run: |
+          python - <<'PY'
+          """PS5 Pro Hunter: conservative product-page monitor and Telegram notifier.
+          
+          Does not bypass authentication, anti-bot controls or robots.txt. Sony monitoring is
+          OFF until the operator has permission for automated access. Never put credentials
+          in this source code.
+          """
+          from __future__ import annotations
+          import datetime as dt
+          import email.utils
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from dataclasses import dataclass
+          from html import unescape
+          from typing import Any
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote, urlsplit, urlunsplit
+          from urllib.request import Request, urlopen
+          from urllib.robotparser import RobotFileParser
+          
+          from bs4 import BeautifulSoup
+          
+          BASE = os.getenv('SUPABASE_URL', 'https://clzdyxuyffaehmeugmyn.supabase.co').rstrip('/')
+          DB_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY') or os.getenv('SUPABASE_SECRET_KEY') or os.getenv('SUPABASE_KEY', '')
+          BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+          CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+          USER_AGENT = 'PS5ProHunter/1.0 (personal non-commercial stock monitoring)'
+          MAX_PRICE = int(os.getenv('MAX_PRICE_EUR', '1100'))
+          MODE = (os.getenv('PS5_SCAN_MODE') or 'marktplaats').lower()
+          SONY_AUTHORIZED = os.getenv('SONY_MONITORING_AUTHORIZED', 'false').lower() == 'true'
+          DRY_RUN = os.getenv('PS5_DRY_RUN', 'false').lower() == 'true'
+          NOW = lambda: dt.datetime.now(dt.timezone.utc)
+          
+          SONY = {
+              'NL': 'https://direct.playstation.com/nl-nl/buy-consoles/playstation5-pro-console-2-tb',
+              'BE': 'https://direct.playstation.com/nl-be/buy-consoles/playstation5-pro-console-2-tb',
+              'DE': 'https://direct.playstation.com/de-de/buy-consoles/playstation5-pro-console-2-tb',
+          }
+          REFURB = {
+              'NL': 'https://direct.playstation.com/nl-nl/certified-refurbished',
+              'BE': 'https://direct.playstation.com/nl-be/certified-refurbished',
+              'DE': 'https://direct.playstation.com/de-de/certified-refurbished',
+          }
+          MARKTPLAATS_URL = 'https://www.marktplaats.nl/q/ps5+pro/'
+          EXCLUDED_WORDS = ('controller', 'dualsense', 'disc drive', 'discdrive', 'standaard',
+                            'cover', 'hoesje', 'hoes ', 'box only', 'lege doos', 'gezocht',
+                            'gewenst', 'playstation portal', 'spel ', 'games ', 'ssd ',
+                            'accessoires', 'schijfstation', 'beschermhoes', 'ps4', 'ps5 slim')
+          SEALED = re.compile(r'(?i)\b(sealed|geseald|ongeopend|nieuw\s+in\s+doos|verzegeld|ongebroken\s+zegel|factory\s+sealed)\b')
+          PRO = re.compile(r'(?i)(?:\bps5\s*pro\b|\bplaystation\s*(?:5|five)\s*pro\b)')
+          OUT = re.compile(r'(?i)(?:op\s+dit\s+moment\s+uitverkocht|momenteel\s+uitverkocht|uitverkocht|derzeit\s+nicht\s+vorr[aä]tig|nicht\s+verf[uü]gbar|sold\s+out|out\s+of\s+stock|en\s+rupture\s+de\s+stock)')
+          IN = re.compile(r'(?i)(?:nu\s+beschikbaar|jetzt\s+erh[aä]ltlich|auf\s+lager|op\s+voorraad|in\s+stock|add\s+to\s+cart|in\s+winkelwagen)')
+          LOCALITIES = ('spijkenisse','leiden','rotterdam','hoogvliet','hellevoetsluis','brielle',
+                        'voorburg','leidschendam','rijswijk','den haag','the hague','katwijk',
+                        'oegstgeest','leiderdorp','voorschoten','wassenaar','zoetermeer',
+                        'schiedam','vlaardingen','nissewaard','maassluis','pijnacker',
+                        'berkel en rodenrijs','roelofarendsveen','alphen aan den rijn',
+                        'noordwijk','sassenheim','delft','warmond','hoogmade','zuidland')
+          
+          @dataclass
+          class Result:
+              source_id: str
+              source_type: str
+              url: str
+              country: str
+              title: str
+              availability: str
+              price: int | None
+              metadata: dict[str, Any]
+              error: str = ''
+          
+          
+          def req(url: str, headers: dict | None = None, method: str = 'GET', payload: Any = None,
+                  timeout: int = 13):
+              h = {'User-Agent': USER_AGENT, 'Accept': 'text/html,application/json;q=0.8', **(headers or {})}
+              raw = None if payload is None else json.dumps(payload, ensure_ascii=False).encode('utf-8')
+              if raw is not None: h.setdefault('Content-Type', 'application/json')
+              request = Request(url, data=raw, headers=h, method=method)
+              try:
+                  with urlopen(request, timeout=timeout) as response:
+                      body = response.read(1_250_000)
+                      return response.status, response.headers, body
+              except HTTPError as ex:
+                  return ex.code, ex.headers, ex.read(5000)
+          
+          
+          def db_headers():
+              if not DB_KEY: raise ValueError('Missing Supabase backend key in GitHub Actions secrets')
+              headers = {'apikey': DB_KEY, 'Content-Type': 'application/json'}
+              # Supabase new sb_secret keys should be passed as apikey, not as fake JWTs.
+              if not DB_KEY.startswith('sb_secret_'): headers['Authorization'] = f'Bearer {DB_KEY}'
+              return headers
+          
+          
+          def db_get(table: str, query: str):
+              status, _, data = req(f'{BASE}/rest/v1/{table}?{query}', headers=db_headers(), timeout=11)
+              if status != 200: raise RuntimeError(f'Supabase GET {table}: HTTP {status}')
+              return json.loads(data)
+          
+          
+          def db_upsert(table: str, record: dict, conflict: str):
+              status, _, _ = req(f'{BASE}/rest/v1/{table}?on_conflict={conflict}',
+                                 headers={**db_headers(), 'Prefer':'resolution=merge-duplicates,return=minimal'},
+                                 method='POST', payload=record, timeout=11)
+              if status not in (200,201,204): raise RuntimeError(f'Supabase UPSERT {table}: HTTP {status}')
+          
+          
+          def db_patch(table: str, query: str, record: dict):
+              status, _, _ = req(f'{BASE}/rest/v1/{table}?{query}', headers=db_headers(),
+                                 method='PATCH', payload=record, timeout=11)
+              if status not in (200,204): raise RuntimeError(f'Supabase UPDATE {table}: HTTP {status}')
+          
+          
+          robots: dict[str, RobotFileParser | None] = {}
+          
+          def robots_allowed(url: str) -> bool:
+              domain = urlsplit(url).netloc.lower()
+              if domain not in robots:
+                  robots_url = f'https://{domain}/robots.txt'
+                  try:
+                      status, _, raw = req(robots_url, headers={'Accept': 'text/plain'})
+                      if status == 404:
+                          parser = RobotFileParser(); parser.parse([]); robots[domain] = parser
+                      elif status == 200:
+                          parser = RobotFileParser(); parser.parse(raw.decode('utf-8','replace').splitlines()); robots[domain] = parser
+                      else:
+                          print(f'robots.txt unavailable for {domain}: HTTP {status}; skipping')
+                          robots[domain] = None
+                  except (URLError,TimeoutError) as ex:
+                      print(f'robots.txt unreadable for {domain}: {type(ex).__name__}; skipping')
+                      robots[domain] = None
+              p = robots[domain]
+              return bool(p and p.can_fetch(USER_AGENT, url))
+          
+          
+          def product_offers(node):
+              if isinstance(node, list):
+                  for each in node:
+                      r=product_offers(each)
+                      if r:return r
+                  return None
+              if not isinstance(node, dict): return None
+              typ=node.get('@type') or ''
+              type_list=typ if isinstance(typ,list) else [typ]
+              if 'Product' in type_list and PRO.search(str(node.get('name',''))):
+                  offers=node.get('offers') or {}
+                  if isinstance(offers,list): offers=offers[0] if offers else {}
+                  return offers if isinstance(offers,dict) else None
+              for key in ('@graph','itemListElement','mainEntity'):
+                  if key in node:
+                      found=product_offers(node[key])
+                      if found:return found
+              return None
+          
+          
+          def to_price(v) -> int | None:
+              if v is None:return None
+              # Only whole euros: a price drop of a cent isn't critical for this watcher.
+              s=str(v).replace('€','').replace('\u00a0','').strip()
+              if ',' in s and '.' in s: s = s.replace('.','').replace(',','.')
+              elif ',' in s: s = s.replace(',','.') if len(s.split(',')[-1])==2 else s.replace(',','')
+              elif '.' in s and len(s.split('.')[-1])==3: s=s.replace('.','')
+              try:
+                  price=float(s)
+                  return int(round(price)) if 20 <= price <= 20000 else None
+              except ValueError:return None
+          
+          
+          def sony_parse(page: str, country: str, url: str):
+              soup=BeautifulSoup(page,'html.parser')
+              h1=soup.find('h1',string=PRO) or next((h for h in soup.find_all('h1') if PRO.search(h.get_text(' ',strip=True))),None)
+              if not h1:return Result(f'sony:{country}','sony',url,country,'PlayStation 5 Pro','unknown',None,{},'Product heading missing')
+              # Prefer structured Product offers. Dynamic storefronts sometimes omit it.
+              offers=None
+              for script in soup.find_all('script',type='application/ld+json'):
+                  try: offers=product_offers(json.loads(script.string or script.get_text())) or offers
+                  except (ValueError,TypeError): pass
+              status='unknown'; price=None
+              if offers:
+                  av=str(offers.get('availability','')).lower()
+                  if 'outofstock' in av or 'soldout' in av: status='out_of_stock'
+                  elif 'instock' in av or 'limitedavailability' in av: status='in_stock'
+                  price=to_price(offers.get('price'))
+                  if price is None and isinstance(offers.get('priceSpecification'),dict): price=to_price(offers['priceSpecification'].get('price'))
+              if status=='unknown':
+                  # Strong, explicit stock language within the first product region, not nav links.
+                  # Avoid generic 'Buy' buttons because those often refer to other products.
+                  section=h1.find_parent('main') or h1.parent.parent or soup
+                  product_text=section.get_text(' ',strip=True)
+                  idx=product_text.lower().find(h1.get_text(' ',strip=True).lower())
+                  focused=product_text[max(0,idx):max(0,idx)+2600]
+                  out=bool(OUT.search(focused)); ins=bool(IN.search(focused))
+                  if out:status='out_of_stock'
+                  elif ins:status='in_stock'
+              return Result(f'sony:{country}','sony',url,country, h1.get_text(' ',strip=True),status,price,{},'')
+          
+          
+          def marktplaats_parse(page: str):
+              soup=BeautifulSoup(page,'html.parser'); found={}
+              counts={'listing_links':0,'valid_ids':0,'ps5_pro_titles':0,'not_accessories':0,'explicitly_sealed':0,'nearby_place':0,'priced_within_limit':0}
+              for a in soup.select('a[href*="/v/"]'):
+                  counts['listing_links']+=1
+                  href=a.get('href') or ''
+                  match=re.search(r'/[ma](\d{7,})\b',href)
+                  if not match: continue
+                  listing_id=match.group(1)
+                  counts['valid_ids']+=1
+                  # Use the nearest listing card. Never guess seller location from the page as a whole.
+                  el=a
+                  for _ in range(5):
+                      if not el.parent:break
+                      el=el.parent
+                      css=' '.join(el.get('class',[])).lower()
+                      if el.name in ('li','article') or 'listing' in css:break
+                  title=a.get_text(' ',strip=True)
+                  combined=el.get_text(' ',strip=True)
+                  if not PRO.search(title): continue
+                  counts['ps5_pro_titles']+=1
+                  if any(x in title.lower() for x in EXCLUDED_WORDS):continue
+                  counts['not_accessories']+=1
+                  if not SEALED.search(combined):continue
+                  counts['explicitly_sealed']+=1
+                  if re.search(r'\b(niet\s+geseald|niet\s+sealed|geopend|gebruikte|gebruikt|tweedehands)\b',combined,re.I):continue
+                  matches=[place for place in LOCALITIES if re.search(r'(?<!\w)'+re.escape(place)+r'(?!\w)',combined,re.I)]
+                  if not matches: continue  # Known place names only. Approximate, not drive-distance proof.
+                  counts['nearby_place']+=1
+                  money=re.search(r'€\s*([\d.,]+)',combined)
+                  price=to_price(money.group(1)) if money else None
+                  if price is None or price>MAX_PRICE:continue
+                  counts['priced_within_limit']+=1
+                  link=href if href.startswith('http') else 'https://www.marktplaats.nl'+href.split('?')[0]
+                  found[listing_id]=Result(f'mp:{listing_id}','marktplaats',link,'NL',title,'in_stock',price,
+                                           {'place_candidates':matches,'location_unverified':True},'')
+              print('Marktplaats filter diagnostics:',json.dumps(counts,sort_keys=True))
+              return list(found.values())
+          
+          
+          def previous(source_id):
+              res=db_get('ps5pro_watch_state','source_id=eq.'+quote(source_id,safe='')+'&select=*')
+              return res[0] if res else None
+          
+          
+          def rest_after(code:int, headers, errors:int)->str:
+              seconds=min(86400,900*(2**min(errors,6)))
+              if code==429 and headers.get('Retry-After'):
+                  raw=headers.get('Retry-After')
+                  try:seconds=max(seconds,int(raw))
+                  except ValueError:
+                      try:seconds=max(seconds,int((email.utils.parsedate_to_datetime(raw)-NOW()).total_seconds()))
+                      except Exception:pass
+              return (NOW()+dt.timedelta(seconds=seconds)).isoformat()
+          
+          
+          def event_key(result:Result, previous_row:dict | None, signal:str):
+              if result.source_type=='marktplaats':
+                  return f'{result.source_id}:{signal}:{result.price}'
+              cycle=int((previous_row or {}).get('metadata',{}).get('cycle',0))
+              if signal=='restock': cycle+=1
+              return f'{result.source_id}:{signal}:{cycle}:{result.price or "unpriced"}'
+          
+          
+          def maybe_alert(result:Result, old:dict | None):
+              if result.availability!='in_stock':return
+              if result.price is not None and result.price>MAX_PRICE:return
+              was=(old or {}).get('availability','unknown')
+              last_price=(old or {}).get('price_eur')
+              signal='restock' if was!='in_stock' else 'price_drop' if result.price is not None and last_price is not None and result.price<last_price else ''
+              if not signal:return
+              key=event_key(result,old,signal)
+              price_str=f'€{result.price}' if result.price is not None else 'Price not verified'
+              place=(result.metadata.get('place_candidates') or [])
+              note='\nLocation: '+', '.join(place)+ ' (verify travel distance)' if place else ''
+              msg=(f'🎮 PS5 PRO {signal.replace("_"," ").upper()} | {result.country}\n'
+                   f'{result.title[:90]}\n{price_str} (maximum €{MAX_PRICE}){note}\n{result.url}\n'
+                   f'Check availability and final price directly before purchasing.')
+              record={'event_key':key,'source_id':result.source_id,'event_type':signal,'title':result.title,
+                      'price_eur':result.price,'url':result.url,'message':msg}
+              if DRY_RUN: print('DRY RUN ALERT:',msg);return
+              db_upsert('ps5pro_alerts',record,'event_key')
+              print('Queued alert:',result.source_id,signal)
+          
+          
+          def store(result:Result, old:dict | None, skip_alert:bool=False):
+              if not skip_alert:maybe_alert(result,old)
+              metadata={**((old or {}).get('metadata') or {}),**result.metadata}
+              changed=(not old or old.get('availability')!=result.availability or old.get('price_eur')!=result.price)
+              if result.availability=='in_stock' and (not old or old.get('availability')!='in_stock'):
+                  metadata['cycle']=int(metadata.get('cycle',0))+1
+              now=NOW().isoformat()
+              row={'source_id':result.source_id,'source_type':result.source_type,'country':result.country,
+                   'product_url':result.url,'title':result.title,'availability':result.availability,
+                   'price_eur':result.price,'checked_at':now,'changed_at':now if changed else old.get('changed_at',now),
+                   'error_count':0 if not result.error else int((old or {}).get('error_count',0))+1,
+                   'last_error':result.error[:250] or None,'metadata':metadata}
+              if not DRY_RUN:db_upsert('ps5pro_watch_state',row,'source_id')
+              print(result.source_id,result.availability,'price',result.price, 'error',result.error[:80])
+          
+          
+          def check_sony(country,url, source_id=None):
+              source=source_id or f'sony:{country}'; old=previous(source) if not DRY_RUN else None
+              if old:
+                  nxt=(old.get('metadata') or {}).get('next_allowed_at')
+                  if nxt:
+                      try:
+                          if dt.datetime.fromisoformat(nxt)>NOW():print('Backoff active:',source);return
+                      except (ValueError,TypeError):pass
+              if not robots_allowed(url):
+                  print('Sony robots.txt disallows or cannot verify access:',source)
+                  return
+              try:
+                  code,headers,body=req(url,headers={'Accept-Language':{'NL':'nl-NL','BE':'nl-BE','DE':'de-DE'}[country]})
+              except (URLError,TimeoutError) as ex:
+                  print('Sony network error:',source,type(ex).__name__);return
+              if code in (403,429,503):
+                  retry=rest_after(code,headers,int((old or {}).get('error_count',0))+1)
+                  if old:
+                      oldmeta=old.get('metadata') or {};oldmeta['next_allowed_at']=retry
+                      db_patch('ps5pro_watch_state','source_id=eq.'+quote(source,safe=''),{'error_count':int(old.get('error_count') or 0)+1,'last_error':f'HTTP {code}','metadata':oldmeta,'checked_at':NOW().isoformat()})
+                  else:
+                      store(Result(source,'sony',url,country,'PlayStation 5 Pro',
+                                   'blocked',None,{'next_allowed_at':retry},f'HTTP {code}'),None,skip_alert=True)
+                  print(f'BLOCKED Sony {country}: HTTP {code}; backoff until {retry}; no stock inference')
+                  return
+              if code!=200:print('Sony unexpected response:',country,code);return
+              result=sony_parse(body.decode('utf-8','replace'),country,url)
+              result.source_id=source
+              if result.availability=='unknown':
+                  print(f'Sony {country}: unknown; not changing previous stock state; {result.error}')
+                  if old and not DRY_RUN:db_patch('ps5pro_watch_state','source_id=eq.'+quote(source,safe=''),{'checked_at':NOW().isoformat(),'last_error':'Parsing inconclusive'})
+                  return
+              store(result,old)
+          
+          
+          
+          def scan_sony_refurbished():
+              """Discover official certified-refurbished PS5 Pro *product* links, then assess
+              the exact product page. Ordinary PS5/PS5 Slim refurb links are ignored.
+              """
+              for country, catalog in REFURB.items():
+                  if not robots_allowed(catalog):
+                      print('Sony refurbished catalog robots.txt denied or unknown:',country)
+                      continue
+                  try:code,headers,body=req(catalog)
+                  except (URLError,TimeoutError) as ex:
+                      print('Sony refurb discovery error:',country,type(ex).__name__);continue
+                  if code!=200:
+                      print('Sony refurbished discovery HTTP:',country,code)
+                      continue
+                  soup=BeautifulSoup(body,'html.parser')
+                  candidate=None
+                  for a in soup.select('a[href]'):
+                      url=a.get('href') or ''
+                      title=a.get_text(' ',strip=True)
+                      if not PRO.search(title): continue
+                      if not re.search(r'(?i)(?:refurb|refurbished|general[uü]berholt|gecertificeerd)',title+' '+url):continue
+                      if not ('pro' in url.lower() and ('refurb' in url.lower() or 'generaluberholt' in url.lower())):continue
+                      candidate=url if url.startswith('https://direct.playstation.com/') else 'https://direct.playstation.com/'+url.lstrip('/')
+                      break
+                  if candidate:
+                      check_sony(country,candidate,source_id=f'sony_refurb:{country}')
+                  else:
+                      print('No official certified-refurbished PS5 Pro product listing:',country)
+          
+          def scan_marketplace():
+              url=MARKTPLAATS_URL
+              if not robots_allowed(url):print('Marktplaats robots.txt disallows or cannot verify access');return
+              try:status,headers,body=req(url,headers={'Accept-Language':'nl-NL'})
+              except (URLError,TimeoutError) as ex:print('Marktplaats network error',type(ex).__name__);return
+              if status in (403,429,503): print('Marktplaats blocking/rate-limiting; stop, do not bypass. HTTP',status);return
+              if status!=200: print('Marktplaats HTTP',status);return
+              matches=marktplaats_parse(body.decode('utf-8','replace'))
+              print('Marktplaats conservative matches:',len(matches))
+              for item in matches[:20]:
+                  old=previous(item.source_id) if not DRY_RUN else None
+                  store(item,old)
+          
+          
+          def flush_alerts():
+              if DRY_RUN:return
+              if not (BOT_TOKEN and CHAT_ID):
+                  print('Telegram credentials missing; messages stay queued');return
+              pending=db_get('ps5pro_alerts','sent_at=is.null&order=created_at.asc&limit=10&select=event_key,message')
+              for alert in pending:
+                  try:
+                      status,_,payload=req(f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+                                            headers={'Accept':'application/json'},method='POST',
+                                            payload={'chat_id':CHAT_ID,'text':alert['message'],'disable_web_page_preview':True},timeout=12)
+                      if status!=200 or not json.loads(payload).get('ok'):
+                          print('Telegram failed HTTP',status)
+                          db_patch('ps5pro_alerts','event_key=eq.'+quote(alert['event_key'],safe=''),{'send_error':f'HTTP {status}'})
+                          break
+                      db_patch('ps5pro_alerts','event_key=eq.'+quote(alert['event_key'],safe=''),{'sent_at':NOW().isoformat(),'send_error':None})
+                      print('Telegram sent:',alert['event_key'])
+                      time.sleep(.3)
+                  except Exception as ex:
+                      print('Telegram delivery problem:',type(ex).__name__)
+                      break
+          
+          
+          def main():
+              if MODE not in ('sony','marktplaats','both'):raise SystemExit('Invalid PS5_SCAN_MODE')
+              if not DRY_RUN and not DB_KEY:raise SystemExit('Missing Supabase key; configure secrets in GitHub')
+              if MODE in ('sony','both'):
+                  if not SONY_AUTHORIZED:
+                      print('SONY DISABLED: no confirmed permission for automated monitoring. No Sony requests sent.')
+                  else:
+                      for country,url in SONY.items():check_sony(country,url)
+                      scan_sony_refurbished()
+              if MODE in ('marktplaats','both'):scan_marketplace()
+              flush_alerts()
+          
+          if __name__=='__main__': main()
+          PY
